@@ -1,17 +1,20 @@
 use crate::{
     cache::LocalCache,
     hash::{ChunkId, Hash32, LayoutId, ProfileId, TreeId},
-    pack::{ChunkEntry, Compression, compress_chunk, read_chunk_from_pack_key, stream_pack_to_key},
+    pack::{
+        ChunkEntry, Compression, StreamingPackWriter, compress_chunk, read_chunk_from_pack_key,
+    },
     profile::load_profile,
     reader::{ReadConfig, TreeReader},
     store::BlobStore,
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::Permissions,
+    os::unix::fs::FileExt,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
@@ -114,6 +117,8 @@ pub struct FileNode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileChunkRef {
     pub file_offset: u64,
+    #[serde(default)]
+    pub chunk_offset: u32,
     pub uncompressed_len: u32,
     pub chunk_id: ChunkId,
 }
@@ -209,6 +214,7 @@ pub async fn pack_directory_with_config<S: BlobStore>(
     }
     paths.sort();
 
+    let mut files = Vec::new();
     let mut jobs = Vec::new();
     for (index, path) in paths.into_iter().enumerate() {
         let rel = path
@@ -219,96 +225,112 @@ pub async fn pack_directory_with_config<S: BlobStore>(
         let metadata = fs::metadata(&path)
             .await
             .with_context(|| format!("stat {}", path.display()))?;
-        jobs.push(PackFileJob {
-            index,
-            path,
-            rel,
+        files.push(FileNode {
+            path: rel.clone(),
             mode: metadata.permissions().mode(),
             size: metadata.len(),
-            chunk_size: config.chunk_size,
+            chunks: Vec::new(),
+        });
+        jobs.push(FileJob {
+            index,
+            path,
+            size: metadata.len(),
         });
     }
 
-    let file_count = jobs.len();
-    let (job_tx, job_rx) = async_channel::bounded(config.pack_workers * 2);
-    let (result_tx, result_rx) = async_channel::bounded(config.pack_workers * 2);
-    let workers = spawn_pack_workers(config.pack_workers, job_rx, result_tx);
+    let (file_tx, file_rx) = async_channel::bounded(config.pack_workers * 16);
+    let (batch_tx, batch_rx) = async_channel::bounded(config.pack_workers * 4);
+    let (ready_tx, ready_rx) = async_channel::bounded(config.pack_workers * 4);
+    let workers = spawn_pack_workers(
+        config.pack_workers,
+        batch_rx,
+        ready_tx.clone(),
+        config.chunk_size,
+    );
+    drop(ready_tx);
 
     let producer = tokio::spawn(async move {
         for job in jobs {
-            if job_tx.send(job).await.is_err() {
+            if file_tx.send(job).await.is_err() {
                 break;
             }
         }
     });
+    let batcher_chunk_size = config.chunk_size;
+    let batcher =
+        tokio::spawn(async move { run_batcher(file_rx, batch_tx, batcher_chunk_size).await });
 
-    let mut files = Vec::with_capacity(file_count);
     let mut locations = Vec::new();
-    let mut pending = Vec::<(ChunkId, Vec<u8>, u32)>::new();
-    let mut pending_compressed_len = 0usize;
-    let mut buffered = BTreeMap::<usize, PackedFile>::new();
-    let mut next_index = 0usize;
+    let mut active_pack = None;
+    let mut next_pack_index = 0usize;
 
-    for _ in 0..file_count {
-        let packed = result_rx.recv().await.context("pack workers stopped")??;
-        buffered.insert(packed.index, packed);
-        while let Some(packed) = buffered.remove(&next_index) {
-            append_packed_file(
-                store,
-                packed,
-                &config,
-                &mut files,
-                &mut pending,
-                &mut pending_compressed_len,
-                &mut locations,
-            )
-            .await?;
-            next_index += 1;
-        }
+    while let Ok(ready) = ready_rx.recv().await {
+        append_ready_chunk(
+            store,
+            ready?,
+            &config,
+            &mut files,
+            &mut active_pack,
+            &mut next_pack_index,
+            &mut locations,
+        )
+        .await?;
     }
     producer.await.context("joining pack job producer")?;
+    batcher.await.context("joining pack batcher")??;
     for worker in workers {
         worker.await.context("joining pack worker")?;
     }
 
-    flush_pack(
-        store,
-        &config,
-        &mut pending,
-        &mut pending_compressed_len,
-        &mut locations,
-    )
-    .await?;
+    finish_active_pack(&mut active_pack, &mut locations).await?;
+    for file in &mut files {
+        file.chunks.sort_by_key(|chunk| chunk.file_offset);
+    }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     locations.sort_by_key(|hint| (hint.pack_key.clone(), hint.compressed_offset, hint.chunk_id));
     let tree = LogicalTreeManifest { version: 1, files };
     write_tree(store, &tree, locations).await
 }
 
-async fn append_packed_file<S: BlobStore>(
+async fn append_ready_chunk<S: BlobStore>(
     store: &S,
-    packed: PackedFile,
+    ready: ReadyChunk,
     config: &PackConfig,
-    files: &mut Vec<FileNode>,
-    pending: &mut Vec<(ChunkId, Vec<u8>, u32)>,
-    pending_compressed_len: &mut usize,
+    files: &mut [FileNode],
+    active_pack: &mut Option<ActivePack>,
+    next_pack_index: &mut usize,
     locations: &mut Vec<ChunkLocationHint>,
 ) -> Result<()> {
-    for chunk in packed.compressed_chunks {
-        *pending_compressed_len += chunk.compressed.len();
-        pending.push((chunk.chunk_id, chunk.compressed, chunk.uncompressed_len));
-        if *pending_compressed_len >= config.pack_target_size {
-            flush_pack(store, config, pending, pending_compressed_len, locations).await?;
-        }
+    let chunk_id = ready.chunk_id;
+    for chunk_ref in ready.refs {
+        let file = files
+            .get_mut(chunk_ref.file_index)
+            .with_context(|| format!("missing file index {}", chunk_ref.file_index))?;
+        file.chunks.push(FileChunkRef {
+            file_offset: chunk_ref.file_offset,
+            chunk_offset: chunk_ref.chunk_offset,
+            uncompressed_len: chunk_ref.uncompressed_len,
+            chunk_id,
+        });
     }
-    files.push(packed.file);
-    Ok(())
+    append_compressed_chunk_to_pack(
+        store,
+        config,
+        active_pack,
+        next_pack_index,
+        locations,
+        chunk_id,
+        ready.compressed,
+        ready.uncompressed_len,
+    )
+    .await
 }
 
 fn spawn_pack_workers(
     worker_count: usize,
-    job_rx: Receiver<PackFileJob>,
-    result_tx: Sender<Result<PackedFile>>,
+    batch_rx: Receiver<BatchJob>,
+    ready_tx: Sender<Result<ReadyChunk>>,
+    chunk_size: usize,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let use_uring = io_uring_available();
     if !use_uring {
@@ -319,34 +341,36 @@ fn spawn_pack_workers(
     }
     let mut workers = Vec::with_capacity(worker_count);
     for worker_id in 0..worker_count {
-        let job_rx = job_rx.clone();
-        let result_tx = result_tx.clone();
+        let batch_rx = batch_rx.clone();
+        let ready_tx = ready_tx.clone();
         workers.push(tokio::task::spawn_blocking(move || {
             if use_uring {
                 tokio_uring::start(async move {
-                    while let Ok(job) = job_rx.recv().await {
+                    while let Ok(batch) = batch_rx.recv().await {
                         debug!(
                             target: "protostore::packer",
                             worker_id,
-                            path = %job.path.display(),
-                            "pack worker processing file with io_uring"
+                            file_count = batch.files.len(),
+                            "pack worker processing batch with io_uring"
                         );
-                        let result = pack_file_with_uring(job).await;
-                        if result_tx.send(result).await.is_err() {
+                        let result = process_batch_with_uring(batch, chunk_size, &ready_tx).await;
+                        if let Err(error) = result {
+                            let _ = ready_tx.send(Err(error)).await;
                             break;
                         }
                     }
                 });
             } else {
-                while let Ok(job) = job_rx.recv_blocking() {
+                while let Ok(batch) = batch_rx.recv_blocking() {
                     debug!(
                         target: "protostore::packer",
                         worker_id,
-                        path = %job.path.display(),
-                        "pack worker processing file with blocking reads"
+                        file_count = batch.files.len(),
+                        "pack worker processing batch with blocking reads"
                     );
-                    let result = pack_file_blocking(job);
-                    if result_tx.send_blocking(result).is_err() {
+                    let result = process_batch_blocking(batch, chunk_size, &ready_tx);
+                    if let Err(error) = result {
+                        let _ = ready_tx.send_blocking(Err(error));
                         break;
                     }
                 }
@@ -356,140 +380,339 @@ fn spawn_pack_workers(
     workers
 }
 
+async fn run_batcher(
+    file_rx: Receiver<FileJob>,
+    batch_tx: Sender<BatchJob>,
+    chunk_size: usize,
+) -> Result<()> {
+    let mut files = Vec::new();
+    let mut bytes = 0usize;
+
+    while let Ok(file) = file_rx.recv().await {
+        if file.size == 0 {
+            continue;
+        }
+        let file_size = usize::try_from(file.size).unwrap_or(usize::MAX);
+        if file_size > chunk_size {
+            flush_batch(&batch_tx, &mut files, &mut bytes).await?;
+            batch_tx
+                .send(BatchJob { files: vec![file] })
+                .await
+                .context("sending large file batch")?;
+            continue;
+        }
+        if bytes + file_size > chunk_size {
+            flush_batch(&batch_tx, &mut files, &mut bytes).await?;
+        }
+        bytes += file_size;
+        files.push(file);
+        if bytes >= chunk_size {
+            flush_batch(&batch_tx, &mut files, &mut bytes).await?;
+        }
+    }
+
+    flush_batch(&batch_tx, &mut files, &mut bytes).await
+}
+
+async fn flush_batch(
+    batch_tx: &Sender<BatchJob>,
+    files: &mut Vec<FileJob>,
+    bytes: &mut usize,
+) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let batch = BatchJob {
+        files: std::mem::take(files),
+    };
+    *bytes = 0;
+    batch_tx.send(batch).await.context("sending file batch")
+}
+
 fn io_uring_available() -> bool {
     io_uring::IoUring::new(1).is_ok()
 }
 
-async fn pack_file_with_uring(job: PackFileJob) -> Result<PackedFile> {
-    let file = tokio_uring::fs::File::open(&job.path)
-        .await
-        .with_context(|| format!("open {}", job.path.display()))?;
-    let mut offset = 0u64;
-    let mut refs = Vec::new();
-    let mut compressed_chunks = Vec::new();
-
-    loop {
-        let buffer = vec![0_u8; job.chunk_size];
-        let (result, mut buffer) = file.read_at(buffer, offset).await;
-        let n = result.with_context(|| format!("read {}", job.path.display()))?;
-        if n == 0 {
-            break;
-        }
-        buffer.truncate(n);
-        let chunk_id = ChunkId::new(Hash32::digest(&buffer));
-        let compressed = compress_chunk(&buffer)?;
-        let uncompressed_len = u32::try_from(n).context("chunk length overflow")?;
-        refs.push(FileChunkRef {
-            file_offset: offset,
-            uncompressed_len,
-            chunk_id,
-        });
-        compressed_chunks.push(CompressedChunk {
-            chunk_id,
-            compressed,
-            uncompressed_len,
-        });
-        offset += n as u64;
+async fn process_batch_with_uring(
+    batch: BatchJob,
+    chunk_size: usize,
+    ready_tx: &Sender<Result<ReadyChunk>>,
+) -> Result<()> {
+    if batch.files.len() > 1 {
+        let ready = bundle_small_files_with_uring(batch.files).await?;
+        send_ready_async(ready_tx, ready).await?;
+        return Ok(());
     }
 
-    Ok(PackedFile {
-        index: job.index,
-        file: FileNode {
-            path: job.rel,
-            mode: job.mode,
-            size: job.size,
-            chunks: refs,
-        },
-        compressed_chunks,
-    })
+    if let Some(file) = batch.files.into_iter().next() {
+        split_file_with_uring(file, chunk_size, ready_tx).await?;
+    }
+    Ok(())
 }
 
-fn pack_file_blocking(job: PackFileJob) -> Result<PackedFile> {
-    use std::io::{Read, Seek, SeekFrom};
+async fn bundle_small_files_with_uring(files: Vec<FileJob>) -> Result<ReadyChunk> {
+    let total_len = files.iter().try_fold(0usize, |acc, file| {
+        Ok::<_, anyhow::Error>(acc + usize::try_from(file.size)?)
+    })?;
+    let mut payload = Vec::with_capacity(total_len);
+    let mut refs = Vec::with_capacity(files.len());
+    for file in files {
+        let chunk_offset = u32::try_from(payload.len()).context("bundle chunk offset overflow")?;
+        let bytes = read_full_file_with_uring(&file).await?;
+        let uncompressed_len = u32::try_from(bytes.len()).context("file chunk length overflow")?;
+        refs.push(ReadyChunkRef {
+            file_index: file.index,
+            file_offset: 0,
+            chunk_offset,
+            uncompressed_len,
+        });
+        payload.extend_from_slice(&bytes);
+    }
+    ready_chunk(refs, payload)
+}
 
-    let mut file =
-        std::fs::File::open(&job.path).with_context(|| format!("open {}", job.path.display()))?;
+async fn split_file_with_uring(
+    file: FileJob,
+    chunk_size: usize,
+    ready_tx: &Sender<Result<ReadyChunk>>,
+) -> Result<()> {
+    let source = tokio_uring::fs::File::open(&file.path)
+        .await
+        .with_context(|| format!("open {}", file.path.display()))?;
     let mut offset = 0u64;
-    let mut refs = Vec::new();
-    let mut compressed_chunks = Vec::new();
+    while offset < file.size {
+        let len = chunk_size.min(usize::try_from(file.size - offset).unwrap_or(usize::MAX));
+        let payload = read_uring_range(&source, &file.path, offset, len).await?;
+        let uncompressed_len =
+            u32::try_from(payload.len()).context("file chunk length overflow")?;
+        let ready = ready_chunk(
+            vec![ReadyChunkRef {
+                file_index: file.index,
+                file_offset: offset,
+                chunk_offset: 0,
+                uncompressed_len,
+            }],
+            payload,
+        )?;
+        send_ready_async(ready_tx, ready).await?;
+        offset += u64::from(uncompressed_len);
+    }
+    Ok(())
+}
 
-    loop {
-        let mut buffer = vec![0_u8; job.chunk_size];
-        file.seek(SeekFrom::Start(offset))
-            .with_context(|| format!("seek {}", job.path.display()))?;
-        let n = file
-            .read(&mut buffer)
-            .with_context(|| format!("read {}", job.path.display()))?;
+async fn read_full_file_with_uring(file: &FileJob) -> Result<Vec<u8>> {
+    let source = tokio_uring::fs::File::open(&file.path)
+        .await
+        .with_context(|| format!("open {}", file.path.display()))?;
+    read_uring_range(&source, &file.path, 0, usize::try_from(file.size)?).await
+}
+
+async fn read_uring_range(
+    file: &tokio_uring::fs::File,
+    path: &Path,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(len);
+    let mut read = 0usize;
+    while read < len {
+        let buffer = vec![0_u8; len - read];
+        let (result, buffer) = file.read_at(buffer, offset + read as u64).await;
+        let n = result.with_context(|| format!("read {}", path.display()))?;
         if n == 0 {
             break;
         }
-        buffer.truncate(n);
-        let chunk_id = ChunkId::new(Hash32::digest(&buffer));
-        let compressed = compress_chunk(&buffer)?;
-        let uncompressed_len = u32::try_from(n).context("chunk length overflow")?;
-        refs.push(FileChunkRef {
-            file_offset: offset,
-            uncompressed_len,
-            chunk_id,
-        });
-        compressed_chunks.push(CompressedChunk {
-            chunk_id,
-            compressed,
-            uncompressed_len,
-        });
-        offset += n as u64;
+        out.extend_from_slice(&buffer[..n]);
+        read += n;
+    }
+    ensure!(
+        read == len,
+        "short read from {}: expected {len}, got {read}",
+        path.display()
+    );
+    Ok(out)
+}
+
+async fn send_ready_async(ready_tx: &Sender<Result<ReadyChunk>>, ready: ReadyChunk) -> Result<()> {
+    ready_tx
+        .send(Ok(ready))
+        .await
+        .map_err(|_| anyhow!("pack writer stopped"))
+}
+
+fn process_batch_blocking(
+    batch: BatchJob,
+    chunk_size: usize,
+    ready_tx: &Sender<Result<ReadyChunk>>,
+) -> Result<()> {
+    if batch.files.len() > 1 {
+        let ready = bundle_small_files_blocking(batch.files)?;
+        send_ready_blocking(ready_tx, ready)?;
+        return Ok(());
     }
 
-    Ok(PackedFile {
-        index: job.index,
-        file: FileNode {
-            path: job.rel,
-            mode: job.mode,
-            size: job.size,
-            chunks: refs,
-        },
-        compressed_chunks,
+    if let Some(file) = batch.files.into_iter().next() {
+        split_file_blocking(file, chunk_size, ready_tx)?;
+    }
+    Ok(())
+}
+
+fn bundle_small_files_blocking(files: Vec<FileJob>) -> Result<ReadyChunk> {
+    let total_len = files.iter().try_fold(0usize, |acc, file| {
+        Ok::<_, anyhow::Error>(acc + usize::try_from(file.size)?)
+    })?;
+    let mut payload = Vec::with_capacity(total_len);
+    let mut refs = Vec::with_capacity(files.len());
+    for file in files {
+        let chunk_offset = u32::try_from(payload.len()).context("bundle chunk offset overflow")?;
+        let bytes = read_full_file_blocking(&file)?;
+        let uncompressed_len = u32::try_from(bytes.len()).context("file chunk length overflow")?;
+        refs.push(ReadyChunkRef {
+            file_index: file.index,
+            file_offset: 0,
+            chunk_offset,
+            uncompressed_len,
+        });
+        payload.extend_from_slice(&bytes);
+    }
+    ready_chunk(refs, payload)
+}
+
+fn split_file_blocking(
+    file: FileJob,
+    chunk_size: usize,
+    ready_tx: &Sender<Result<ReadyChunk>>,
+) -> Result<()> {
+    let source =
+        std::fs::File::open(&file.path).with_context(|| format!("open {}", file.path.display()))?;
+    let mut offset = 0u64;
+    while offset < file.size {
+        let len = chunk_size.min(usize::try_from(file.size - offset).unwrap_or(usize::MAX));
+        let payload = read_blocking_range(&source, &file.path, offset, len)?;
+        let uncompressed_len =
+            u32::try_from(payload.len()).context("file chunk length overflow")?;
+        let ready = ready_chunk(
+            vec![ReadyChunkRef {
+                file_index: file.index,
+                file_offset: offset,
+                chunk_offset: 0,
+                uncompressed_len,
+            }],
+            payload,
+        )?;
+        send_ready_blocking(ready_tx, ready)?;
+        offset += u64::from(uncompressed_len);
+    }
+    Ok(())
+}
+
+fn read_full_file_blocking(file: &FileJob) -> Result<Vec<u8>> {
+    let source =
+        std::fs::File::open(&file.path).with_context(|| format!("open {}", file.path.display()))?;
+    read_blocking_range(&source, &file.path, 0, usize::try_from(file.size)?)
+}
+
+fn read_blocking_range(
+    file: &std::fs::File,
+    path: &Path,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>> {
+    let mut out = vec![0_u8; len];
+    let mut read = 0usize;
+    while read < len {
+        let n = file
+            .read_at(&mut out[read..], offset + read as u64)
+            .with_context(|| format!("read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    ensure!(
+        read == len,
+        "short read from {}: expected {len}, got {read}",
+        path.display()
+    );
+    Ok(out)
+}
+
+fn send_ready_blocking(ready_tx: &Sender<Result<ReadyChunk>>, ready: ReadyChunk) -> Result<()> {
+    ready_tx
+        .send_blocking(Ok(ready))
+        .map_err(|_| anyhow!("pack writer stopped"))
+}
+
+fn ready_chunk(refs: Vec<ReadyChunkRef>, payload: Vec<u8>) -> Result<ReadyChunk> {
+    let chunk_id = ChunkId::new(Hash32::digest(&payload));
+    let uncompressed_len = u32::try_from(payload.len()).context("chunk length overflow")?;
+    let compressed = compress_chunk(&payload)?;
+    Ok(ReadyChunk {
+        refs,
+        chunk_id,
+        compressed,
+        uncompressed_len,
     })
 }
 
 #[derive(Debug)]
-struct PackFileJob {
+struct FileJob {
     index: usize,
     path: PathBuf,
-    rel: String,
-    mode: u32,
     size: u64,
-    chunk_size: usize,
 }
 
 #[derive(Debug)]
-struct PackedFile {
-    index: usize,
-    file: FileNode,
-    compressed_chunks: Vec<CompressedChunk>,
+struct BatchJob {
+    files: Vec<FileJob>,
 }
 
 #[derive(Debug)]
-struct CompressedChunk {
+struct ReadyChunk {
+    refs: Vec<ReadyChunkRef>,
     chunk_id: ChunkId,
     compressed: Vec<u8>,
     uncompressed_len: u32,
 }
 
-async fn flush_pack<S: BlobStore>(
+#[derive(Debug)]
+struct ReadyChunkRef {
+    file_index: usize,
+    file_offset: u64,
+    chunk_offset: u32,
+    uncompressed_len: u32,
+}
+
+struct ActivePack {
+    key: String,
+    compressed_len: usize,
+    writer: StreamingPackWriter,
+}
+
+async fn start_active_pack<S: BlobStore>(
     store: &S,
     config: &PackConfig,
-    pending: &mut Vec<(ChunkId, Vec<u8>, u32)>,
-    pending_compressed_len: &mut usize,
+    pack_index: usize,
+) -> Result<ActivePack> {
+    let key = pack_key_for_index(config, pack_index);
+    let writer =
+        StreamingPackWriter::start(store, &key, PACK_TARGET_SIZE.min(64 * 1024 * 1024)).await?;
+    Ok(ActivePack {
+        key,
+        compressed_len: 0,
+        writer,
+    })
+}
+
+async fn finish_active_pack(
+    active_pack: &mut Option<ActivePack>,
     locations: &mut Vec<ChunkLocationHint>,
 ) -> Result<()> {
-    if pending.is_empty() {
+    let Some(pack) = active_pack.take() else {
         return Ok(());
-    }
-    let chunks = std::mem::take(pending);
-    let key = next_pack_key(config, locations);
-    let (pack_id, index) =
-        stream_pack_to_key(store, &key, chunks, PACK_TARGET_SIZE.min(64 * 1024 * 1024)).await?;
+    };
+    let key = pack.key;
+    let (pack_id, index) = pack.writer.finish().await?;
     let pack_hash = pack_id.0;
     for entry in index.chunks {
         locations.push(ChunkLocationHint {
@@ -501,16 +724,37 @@ async fn flush_pack<S: BlobStore>(
             uncompressed_len: entry.uncompressed_len,
         });
     }
-    *pending_compressed_len = 0;
     Ok(())
 }
 
-fn next_pack_key(config: &PackConfig, locations: &[ChunkLocationHint]) -> String {
-    let pack_index = locations
-        .iter()
-        .map(|hint| hint.pack_key.as_str())
-        .collect::<std::collections::HashSet<_>>()
-        .len();
+async fn append_compressed_chunk_to_pack<S: BlobStore>(
+    store: &S,
+    config: &PackConfig,
+    active_pack: &mut Option<ActivePack>,
+    next_pack_index: &mut usize,
+    locations: &mut Vec<ChunkLocationHint>,
+    chunk_id: ChunkId,
+    compressed: Vec<u8>,
+    uncompressed_len: u32,
+) -> Result<()> {
+    if active_pack.is_none() {
+        *active_pack = Some(start_active_pack(store, config, *next_pack_index).await?);
+        *next_pack_index += 1;
+    }
+    let pack = active_pack
+        .as_mut()
+        .context("active pack missing after start")?;
+    pack.compressed_len += compressed.len();
+    pack.writer
+        .append_chunk(chunk_id, compressed, uncompressed_len)
+        .await?;
+    if pack.compressed_len >= config.pack_target_size {
+        finish_active_pack(active_pack, locations).await?;
+    }
+    Ok(())
+}
+
+fn pack_key_for_index(config: &PackConfig, pack_index: usize) -> String {
     format!("packs/{}/{pack_index:06}.pack", config.pack_key_prefix)
 }
 
@@ -599,8 +843,8 @@ pub async fn repack_tree_with_config<S: BlobStore>(
     });
 
     let mut new_locations = Vec::new();
-    let mut pending = Vec::<(ChunkId, Vec<u8>, u32)>::new();
-    let mut pending_len = 0usize;
+    let mut active_pack = None;
+    let mut next_pack_index = 0usize;
     for (chunk_id, _, _) in chunk_order {
         let hint = location_by_chunk
             .get(&chunk_id)
@@ -618,27 +862,19 @@ pub async fn repack_tree_with_config<S: BlobStore>(
             "chunk hash mismatch while repacking {chunk_id}"
         );
         let compressed = compress_chunk(&decompressed)?;
-        pending_len += compressed.len();
-        pending.push((chunk_id, compressed, hint.uncompressed_len));
-        if pending_len >= config.pack_target_size {
-            flush_pack(
-                store,
-                &config,
-                &mut pending,
-                &mut pending_len,
-                &mut new_locations,
-            )
-            .await?;
-        }
+        append_compressed_chunk_to_pack(
+            store,
+            &config,
+            &mut active_pack,
+            &mut next_pack_index,
+            &mut new_locations,
+            chunk_id,
+            compressed,
+            hint.uncompressed_len,
+        )
+        .await?;
     }
-    flush_pack(
-        store,
-        &config,
-        &mut pending,
-        &mut pending_len,
-        &mut new_locations,
-    )
-    .await?;
+    finish_active_pack(&mut active_pack, &mut new_locations).await?;
     new_locations
         .sort_by_key(|hint| (hint.pack_key.clone(), hint.compressed_offset, hint.chunk_id));
     let new_layout = LayoutManifest {

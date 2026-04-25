@@ -1,6 +1,6 @@
 mod cli;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{Cli, Command};
 use protostore_core::{
@@ -33,7 +33,7 @@ fn main() -> Result<()> {
             println!("{tree_id}");
         }
         Command::Inspect { tree_id, store } => {
-            let tree_id = TreeId::from_str(&tree_id).context("parsing tree id")?;
+            let tree_id = parse_tree_id(&tree_id)?;
             let store = ObjectBlobStore::from_uri(&store)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
             let tree = runtime.block_on(protostore_core::tree::load_tree(&store, tree_id))?;
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
             min_remote_read,
             target_coalesce,
         } => {
-            let tree_id = TreeId::from_str(&tree_id).context("parsing tree id")?;
+            let tree_id = parse_tree_id(&tree_id)?;
             let store = ObjectBlobStore::from_uri(&store)?;
             let read_config = read_config(min_remote_read, target_coalesce)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
@@ -86,7 +86,7 @@ fn main() -> Result<()> {
             min_remote_read,
             target_coalesce,
         } => {
-            let tree_id = TreeId::from_str(&tree_id).context("parsing tree id")?;
+            let tree_id = parse_tree_id(&tree_id)?;
             let store = ObjectBlobStore::from_uri(&store)?;
             let read_config = read_config(min_remote_read, target_coalesce)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
@@ -103,7 +103,7 @@ fn main() -> Result<()> {
             profile,
             store,
         } => {
-            let tree_id = TreeId::from_str(&tree_id).context("parsing tree id")?;
+            let tree_id = parse_tree_id(&tree_id)?;
             let profile_id = ProfileId::from_str(&profile).context("parsing profile id")?;
             let store = ObjectBlobStore::from_uri(&store)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
@@ -112,6 +112,15 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_tree_id(value: &str) -> Result<TreeId> {
+    if value.contains('-') {
+        bail!(
+            "parsing tree id: {value} looks like a pack key UUID, not a TreeId. Use the 64-character hex id printed by `protostore pack`, or inspect trees/<tree-id>.tree in the store."
+        );
+    }
+    TreeId::from_str(value).context("parsing tree id")
 }
 
 fn is_mounted(mountpoint: &Path) -> Result<bool> {

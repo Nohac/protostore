@@ -211,6 +211,7 @@ impl<S: BlobStore> TreeReader<S> {
                 path,
                 chunk_id = %chunk.chunk_id,
                 chunk_file_offset = chunk.file_offset,
+                chunk_payload_offset = chunk.chunk_offset,
                 chunk_uncompressed_len = chunk.uncompressed_len,
                 take_start,
                 take_end,
@@ -218,6 +219,7 @@ impl<S: BlobStore> TreeReader<S> {
             );
             selected.push(SelectedChunk {
                 chunk_id: chunk.chunk_id,
+                chunk_offset: chunk.chunk_offset as usize,
                 take_start,
                 take_end,
             });
@@ -227,7 +229,15 @@ impl<S: BlobStore> TreeReader<S> {
             let chunk_bytes = chunks
                 .get(&selected.chunk_id)
                 .with_context(|| format!("missing decoded chunk {}", selected.chunk_id))?;
-            out.extend_from_slice(&chunk_bytes[selected.take_start..selected.take_end]);
+            let start = selected.chunk_offset + selected.take_start;
+            let end = selected.chunk_offset + selected.take_end;
+            let slice = chunk_bytes.get(start..end).with_context(|| {
+                format!(
+                    "chunk range {start}..{end} is outside {}",
+                    selected.chunk_id
+                )
+            })?;
+            out.extend_from_slice(slice);
         }
         Ok(out.freeze())
     }
@@ -417,6 +427,7 @@ impl<S: BlobStore> TreeReader<S> {
 #[derive(Debug, Clone, Copy)]
 struct SelectedChunk {
     chunk_id: crate::ChunkId,
+    chunk_offset: usize,
     take_start: usize,
     take_end: usize,
 }

@@ -51,6 +51,7 @@ fn tree_manifest_deterministic_hash() {
             size: 1,
             chunks: vec![FileChunkRef {
                 file_offset: 0,
+                chunk_offset: 0,
                 uncompressed_len: 1,
                 chunk_id,
             }],
@@ -123,6 +124,44 @@ async fn pack_directory_and_materialize_roundtrip() {
         b"alpha"
     );
     assert_eq!(fs::read(output.path().join("b.txt")).unwrap(), b"beta");
+}
+
+#[tokio::test]
+async fn pack_directory_bundles_small_files_into_shared_chunks() {
+    let input = TempDir::new().unwrap();
+    let store_dir = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    write(&input.path().join("a.txt"), b"alpha");
+    write(&input.path().join("b.txt"), b"beta");
+    let store = local_store(&store_dir);
+    let tree_id = pack_directory_with_config(
+        &store,
+        input.path(),
+        PackConfig {
+            chunk_size: 1024,
+            pack_target_size: 1024,
+            pack_workers: 2,
+            pack_key_prefix: "test-bundle".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let tree = load_tree(&store, tree_id).await.unwrap();
+    let layout = load_layout(&store, tree.layout_id).await.unwrap();
+    assert_eq!(layout.locations.len(), 1);
+    assert_eq!(tree.files.len(), 2);
+    assert_eq!(
+        tree.files[0].chunks[0].chunk_id,
+        tree.files[1].chunks[0].chunk_id
+    );
+    assert_eq!(tree.files[0].chunks[0].chunk_offset, 0);
+    assert_eq!(tree.files[1].chunks[0].chunk_offset, 5);
+
+    let reader = TreeReader::open(store, tree_id, LocalCache::new(cache_dir.path()))
+        .await
+        .unwrap();
+    assert_eq!(reader.read_at("a.txt", 1, 3).await.unwrap(), "lph");
+    assert_eq!(reader.read_at("b.txt", 1, 2).await.unwrap(), "et");
 }
 
 #[tokio::test]

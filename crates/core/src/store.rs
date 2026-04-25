@@ -6,7 +6,11 @@ use object_store::{
     path::Path as ObjectPath,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
+use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
 #[async_trait]
@@ -38,6 +42,7 @@ pub trait BlobUpload: Send {
 #[derive(Clone)]
 pub struct ObjectBlobStore {
     inner: Arc<dyn ObjectStore>,
+    local_root: Option<Arc<PathBuf>>,
 }
 
 impl ObjectBlobStore {
@@ -51,10 +56,11 @@ impl ObjectBlobStore {
         let root = PathBuf::from(prefix);
         std::fs::create_dir_all(&root)
             .with_context(|| format!("creating local object store {}", root.display()))?;
-        let fs = LocalFileSystem::new_with_prefix(root)
+        let fs = LocalFileSystem::new_with_prefix(&root)
             .context("creating local object store with prefix")?;
         Ok(Self {
             inner: Arc::new(fs),
+            local_root: Some(Arc::new(root)),
         })
     }
 }
@@ -70,6 +76,22 @@ impl BlobStore for ObjectBlobStore {
     }
 
     async fn begin_multipart(&self, key: &str, part_size: usize) -> Result<Box<dyn BlobUpload>> {
+        if let Some(root) = &self.local_root {
+            let path = local_object_path(root, key)?;
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("creating parent directory for {key}"))?;
+            }
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)
+                .await
+                .with_context(|| format!("begin direct local upload {key}"))?;
+            return Ok(Box::new(LocalFileUpload { path, file }));
+        }
         let upload = self
             .inner
             .put_multipart(&ObjectPath::from(key))
@@ -117,6 +139,21 @@ impl BlobStore for ObjectBlobStore {
     }
 }
 
+fn local_object_path(root: &Path, key: &str) -> Result<PathBuf> {
+    let key_path = Path::new(key);
+    if key_path.is_absolute()
+        || key_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("unsafe object key {key}");
+    }
+    Ok(root.join(key_path))
+}
+
 struct ObjectBlobUpload {
     inner: WriteMultipart,
 }
@@ -137,5 +174,41 @@ impl BlobUpload for ObjectBlobUpload {
     async fn abort(self: Box<Self>) -> Result<()> {
         self.inner.abort().await?;
         Ok(())
+    }
+}
+
+struct LocalFileUpload {
+    path: PathBuf,
+    file: tokio::fs::File,
+}
+
+#[async_trait]
+impl BlobUpload for LocalFileUpload {
+    async fn put(&mut self, bytes: Bytes) -> Result<()> {
+        self.file
+            .write_all(&bytes)
+            .await
+            .with_context(|| format!("write direct local upload {}", self.path.display()))?;
+        self.file
+            .flush()
+            .await
+            .with_context(|| format!("flush direct local upload {}", self.path.display()))
+    }
+
+    async fn finish(mut self: Box<Self>) -> Result<()> {
+        self.file
+            .flush()
+            .await
+            .with_context(|| format!("finish direct local upload {}", self.path.display()))
+    }
+
+    async fn abort(self: Box<Self>) -> Result<()> {
+        drop(self.file);
+        match tokio::fs::remove_file(&self.path).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err)
+                .with_context(|| format!("abort direct local upload {}", self.path.display())),
+        }
     }
 }
