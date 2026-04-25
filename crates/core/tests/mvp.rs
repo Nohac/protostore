@@ -1,10 +1,10 @@
 use protostore_core::{
     BlobStore, ChunkId, FileChunkRef, FileNode, Hash32, LocalCache, ObjectBlobStore, PackConfig,
-    ProfileRecorder, TreeId, TreeManifest, TreeReader,
+    ProfileRecorder, TreeId, TreeReader,
     pack::{FOOTER_LEN, compress_chunk, decompress_chunk, encode_pack, parse_footer},
     pack_directory_with_config,
     profile::write_profile,
-    tree::{load_tree, pack_directory, repack_tree, tree_id},
+    tree::{LogicalTreeManifest, load_layout, load_tree, pack_directory, repack_tree, tree_id},
 };
 use std::{fs, path::Path};
 use tempfile::TempDir;
@@ -43,7 +43,7 @@ fn chunk_compression_roundtrip() {
 #[test]
 fn tree_manifest_deterministic_hash() {
     let chunk_id = ChunkId::new(Hash32::digest(b"a"));
-    let tree = TreeManifest {
+    let tree = LogicalTreeManifest {
         version: 1,
         files: vec![FileNode {
             path: "a.txt".into(),
@@ -55,7 +55,6 @@ fn tree_manifest_deterministic_hash() {
                 chunk_id,
             }],
         }],
-        locations: vec![],
     };
     assert_eq!(tree_id(&tree).unwrap(), tree_id(&tree.clone()).unwrap());
 }
@@ -177,9 +176,13 @@ async fn repack_produces_readable_output() {
     let profile_id = write_profile(&store, &reader.recorder().unwrap().profile())
         .await
         .unwrap();
+    let original_layout = load_tree(&store, original_tree).await.unwrap().layout_id;
     let new_tree = repack_tree(&store, original_tree, profile_id)
         .await
         .unwrap();
+    assert_eq!(new_tree, original_tree);
+    let updated_layout = load_tree(&store, original_tree).await.unwrap().layout_id;
+    assert_ne!(updated_layout, original_layout);
     let new_reader = TreeReader::open(store, new_tree, LocalCache::new(cache_dir.path()))
         .await
         .unwrap();
@@ -195,6 +198,15 @@ async fn tree_object_is_written_last_and_loadable() {
     let store = local_store(&store_dir);
     let id = pack_directory(&store, input.path()).await.unwrap();
     let tree = load_tree(&store, id).await.unwrap();
+    let layout = load_layout(&store, tree.layout_id).await.unwrap();
     assert_eq!(tree.files.len(), 1);
+    assert_eq!(layout.tree_id, id);
+    assert_eq!(layout.locations.len(), 1);
     assert!(store.exists(&format!("trees/{id}.tree")).await.unwrap());
+    assert!(
+        store
+            .exists(&format!("layouts/{}.layout", tree.layout_id))
+            .await
+            .unwrap()
+    );
 }

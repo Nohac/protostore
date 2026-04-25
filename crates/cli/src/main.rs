@@ -36,7 +36,9 @@ fn main() -> Result<()> {
             let store = ObjectBlobStore::from_uri(&store)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
             let tree = runtime.block_on(protostore_core::tree::load_tree(&store, tree_id))?;
-            println!("{}", inspect_tree(tree_id, &tree));
+            let layout =
+                runtime.block_on(protostore_core::tree::load_layout(&store, tree.layout_id))?;
+            println!("{}", inspect_tree(tree_id, &tree, &layout));
         }
         Command::Mount {
             tree_id,

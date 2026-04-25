@@ -50,6 +50,7 @@ All durable state lives under object-store keys:
 ```text
 packs/<pack-id>.pack
 trees/<tree-id>.tree
+layouts/<layout-id>.layout
 profiles/<profile-id>.profile
 refs/<name>.ref
 ```
@@ -58,15 +59,15 @@ Local disk is disposable cache only, currently `.protostore-cache/chunks/<chunk-
 
 ## Pack Format
 
-Pack blobs use a fixed header, independently compressed zstd chunk frames, a JSON index, and a fixed footer. Readers parse the footer, verify the index hash, resolve chunk offsets, then range-read only the compressed chunk frames needed for a file read.
+Pack blobs use a fixed header, independently compressed zstd chunk frames, a JSON index, and a fixed footer. Tree manifests describe logical files and chunk IDs. Layout manifests map chunk IDs to physical pack offsets. Readers parse the footer, verify the index hash, resolve chunk offsets through the layout, then range-read only the compressed chunk frames needed for a file read.
 
 Implementation note: the original MVP spec put `pack_id` inside the hashed pack index while also defining `pack_id` as the hash of the full pack bytes. This implementation skips serializing `pack_id` inside the index and fills it from the pack key when reading.
 
-Packing uses bounded `tokio-uring` workers on Linux to read files and compute chunk hashes/compression concurrently. The CLI defaults `--pack-workers` to the number of available CPU threads. Worker results are reassembled in deterministic path order before packs are written, so parallelism does not change tree identity for the same inputs and pack config.
+Packing uses bounded `tokio-uring` workers on Linux to read files and compute chunk hashes/compression concurrently. The CLI defaults `--pack-workers` to the number of available CPU threads. Tree identity is based on logical file content; physical pack layout is stored separately in a layout object.
 
 ## Lazy Reads And FUSE
 
-`TreeReader` maps logical file ranges to chunk references, resolves chunk location hints, coalesces adjacent compressed chunk reads from the same pack, decompresses selected chunks, and stores decompressed chunks in the local disposable cache. The FUSE crate is intentionally thin and delegates file content reads to `TreeReader`.
+`TreeReader` loads a tree and its referenced layout, maps logical file ranges to chunk references, resolves chunk locations, coalesces adjacent compressed chunk reads from the same pack, decompresses selected chunks, and stores decompressed chunks in the local disposable cache. The FUSE crate is intentionally thin and delegates file content reads to `TreeReader`.
 
 Enable tracing to inspect lazy reads:
 
@@ -83,4 +84,3 @@ Look for `read_at selected chunk`, `fetch coalesced compressed chunk range`, `ob
 - `file://` stores are implemented first; S3/GCS/Azure URI parsing is not wired yet.
 - Pack index loading currently fetches the full pack before parsing the footer, while file-content reads use coalesced compressed chunk ranges.
 - Access profiles are implemented in core, but the CLI does not yet expose explicit profiling flags for materialize/read.
-- Embedded location hints mean repacking creates a new tree ID in the MVP.
