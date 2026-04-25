@@ -15,6 +15,15 @@ pub enum Command {
         directory: PathBuf,
         #[arg(long)]
         store: String,
+        #[arg(long, value_parser = crate::parse_size)]
+        chunk_size: Option<usize>,
+        #[arg(long, value_parser = crate::parse_size)]
+        pack_target_size: Option<usize>,
+        #[arg(
+            long,
+            help = "Number of parallel pack workers. Defaults to available CPU threads."
+        )]
+        pack_workers: Option<usize>,
     },
     Inspect {
         tree_id: String,
@@ -26,12 +35,20 @@ pub enum Command {
         mountpoint: PathBuf,
         #[arg(long)]
         store: String,
+        #[arg(long, value_parser = crate::parse_size)]
+        min_remote_read: Option<usize>,
+        #[arg(long, value_parser = crate::parse_size)]
+        target_coalesce: Option<usize>,
     },
     Materialize {
         tree_id: String,
         output_dir: PathBuf,
         #[arg(long)]
         store: String,
+        #[arg(long, value_parser = crate::parse_size)]
+        min_remote_read: Option<usize>,
+        #[arg(long, value_parser = crate::parse_size)]
+        target_coalesce: Option<usize>,
     },
     Repack {
         tree_id: String,

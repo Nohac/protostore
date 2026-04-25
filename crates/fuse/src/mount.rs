@@ -3,7 +3,7 @@ use fuser::{
     BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
     ReplyDirectory, ReplyEntry, ReplyOpen, Request,
 };
-use protostore_core::{BlobStore, LocalCache, TreeId, TreeReader};
+use protostore_core::{BlobStore, LocalCache, ReadConfig, TreeId, TreeReader};
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::{OsStr, OsString},
@@ -19,6 +19,7 @@ pub struct ProtoStoreFuseBuilder<S> {
     store: S,
     tree_id: TreeId,
     cache: LocalCache,
+    read_config: ReadConfig,
     runtime: Option<Handle>,
     fs_name: String,
     default_permissions: bool,
@@ -30,6 +31,7 @@ impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
             store,
             tree_id,
             cache: LocalCache::disposable_default(),
+            read_config: ReadConfig::default(),
             runtime: None,
             fs_name: "protostore".to_string(),
             default_permissions: true,
@@ -43,6 +45,11 @@ impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
 
     pub fn cache(mut self, cache: LocalCache) -> Self {
         self.cache = cache;
+        self
+    }
+
+    pub fn read_config(mut self, read_config: ReadConfig) -> Self {
+        self.read_config = read_config;
         self
     }
 
@@ -61,7 +68,12 @@ impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
             .runtime
             .context("FUSE builder requires a Tokio runtime handle")?;
         let reader = runtime
-            .block_on(TreeReader::open(self.store, self.tree_id, self.cache))
+            .block_on(TreeReader::open_with_config(
+                self.store,
+                self.tree_id,
+                self.cache,
+                self.read_config,
+            ))
             .context("opening tree reader for FUSE")?;
         let fs = ProtoStoreFs::new(runtime, reader);
         let mut options = vec![MountOption::RO, MountOption::FSName(self.fs_name)];
@@ -93,10 +105,12 @@ pub fn mount_readonly_with_runtime<S: BlobStore>(
     tree_id: TreeId,
     mountpoint: &Path,
     cache: LocalCache,
+    read_config: ReadConfig,
 ) -> Result<()> {
     ProtoStoreFuseBuilder::new(store, tree_id)
         .runtime_handle(runtime)
         .cache(cache)
+        .read_config(read_config)
         .mount(mountpoint)
 }
 

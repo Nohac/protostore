@@ -19,14 +19,54 @@ pub struct TreeReader<S> {
     tree: TreeManifest,
     files: HashMap<String, FileNode>,
     locations: HashMap<crate::ChunkId, crate::ChunkLocationHint>,
+    pack_data_end: HashMap<crate::PackId, u64>,
     cache: LocalCache,
     recorder: Option<ProfileRecorder>,
+    read_config: ReadConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadConfig {
+    pub min_remote_read: usize,
+    pub target_coalesce: usize,
+}
+
+impl Default for ReadConfig {
+    fn default() -> Self {
+        Self {
+            min_remote_read: 16 * 1024 * 1024,
+            target_coalesce: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl ReadConfig {
+    pub fn validate(self) -> Result<Self> {
+        ensure!(
+            self.min_remote_read > 0,
+            "minimum remote read must be greater than zero"
+        );
+        ensure!(
+            self.target_coalesce >= self.min_remote_read,
+            "target coalesce size must be at least min remote read size"
+        );
+        Ok(self)
+    }
 }
 
 impl<S: BlobStore> TreeReader<S> {
     pub async fn open(store: S, tree_id: TreeId, cache: LocalCache) -> Result<Self> {
+        Self::open_with_config(store, tree_id, cache, ReadConfig::default()).await
+    }
+
+    pub async fn open_with_config(
+        store: S,
+        tree_id: TreeId,
+        cache: LocalCache,
+        read_config: ReadConfig,
+    ) -> Result<Self> {
         let tree = load_tree(&store, tree_id).await?;
-        Self::from_manifest(store, tree_id, tree, cache, None)
+        Self::from_manifest_with_config(store, tree_id, tree, cache, None, read_config)
     }
 
     pub fn from_manifest(
@@ -36,20 +76,49 @@ impl<S: BlobStore> TreeReader<S> {
         cache: LocalCache,
         recorder: Option<ProfileRecorder>,
     ) -> Result<Self> {
+        Self::from_manifest_with_config(
+            store,
+            tree_id,
+            tree,
+            cache,
+            recorder,
+            ReadConfig::default(),
+        )
+    }
+
+    pub fn from_manifest_with_config(
+        store: S,
+        tree_id: TreeId,
+        tree: TreeManifest,
+        cache: LocalCache,
+        recorder: Option<ProfileRecorder>,
+        read_config: ReadConfig,
+    ) -> Result<Self> {
+        let read_config = read_config.validate()?;
         let files = tree
             .files
             .iter()
             .map(|file| (file.path.clone(), file.clone()))
             .collect();
         let locations = location_map(&tree);
+        let mut pack_data_end = HashMap::<crate::PackId, u64>::new();
+        for hint in &tree.locations {
+            let end = hint.compressed_offset + u64::from(hint.compressed_len);
+            pack_data_end
+                .entry(hint.pack_id)
+                .and_modify(|current| *current = (*current).max(end))
+                .or_insert(end);
+        }
         Ok(Self {
             store,
             tree_id,
             tree,
             files,
             locations,
+            pack_data_end,
             cache,
             recorder,
+            read_config,
         })
     }
 
@@ -64,6 +133,11 @@ impl<S: BlobStore> TreeReader<S> {
     pub fn with_recorder(mut self, recorder: ProfileRecorder) -> Self {
         self.recorder = Some(recorder);
         self
+    }
+
+    pub fn with_read_config(mut self, read_config: ReadConfig) -> Result<Self> {
+        self.read_config = read_config.validate()?;
+        Ok(self)
     }
 
     pub async fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Bytes> {
@@ -95,6 +169,7 @@ impl<S: BlobStore> TreeReader<S> {
             "read_at"
         );
         let mut out = BytesMut::with_capacity((end - offset) as usize);
+        let mut selected = Vec::new();
         for chunk in &file.chunks {
             let chunk_start = chunk.file_offset;
             let chunk_end = chunk.file_offset + u64::from(chunk.uncompressed_len);
@@ -114,78 +189,161 @@ impl<S: BlobStore> TreeReader<S> {
                 take_end,
                 "read_at selected chunk"
             );
-            let chunk_bytes = self.read_chunk(chunk.chunk_id).await?;
-            out.extend_from_slice(&chunk_bytes[take_start..take_end]);
+            selected.push(SelectedChunk {
+                chunk_id: chunk.chunk_id,
+                take_start,
+                take_end,
+            });
+        }
+        let chunks = self.read_chunks(&selected).await?;
+        for selected in selected {
+            let chunk_bytes = chunks
+                .get(&selected.chunk_id)
+                .with_context(|| format!("missing decoded chunk {}", selected.chunk_id))?;
+            out.extend_from_slice(&chunk_bytes[selected.take_start..selected.take_end]);
         }
         Ok(out.freeze())
     }
 
-    async fn read_chunk(&self, chunk_id: crate::ChunkId) -> Result<Bytes> {
-        if let Some(bytes) = self.cache.get_chunk(chunk_id).await? {
-            debug!(
-                target: "protostore::reader",
-                tree_id = %self.tree_id,
-                chunk_id = %chunk_id,
-                uncompressed_len = bytes.len(),
-                "chunk cache hit"
-            );
-            if let Some(recorder) = &self.recorder {
-                recorder.record(self.tree_id, chunk_id);
+    async fn read_chunks(
+        &self,
+        selected: &[SelectedChunk],
+    ) -> Result<HashMap<crate::ChunkId, Bytes>> {
+        let mut out = HashMap::new();
+        let mut misses = Vec::new();
+        for selected in selected {
+            let chunk_id = selected.chunk_id;
+            if let Some(bytes) = self.cache.get_chunk(chunk_id).await? {
+                debug!(
+                    target: "protostore::reader",
+                    tree_id = %self.tree_id,
+                    chunk_id = %chunk_id,
+                    uncompressed_len = bytes.len(),
+                    "chunk cache hit"
+                );
+                if let Some(recorder) = &self.recorder {
+                    recorder.record(self.tree_id, chunk_id);
+                }
+                out.insert(chunk_id, bytes);
+            } else {
+                debug!(
+                    target: "protostore::reader",
+                    tree_id = %self.tree_id,
+                    chunk_id = %chunk_id,
+                    "chunk cache miss"
+                );
+                let hint = self
+                    .locations
+                    .get(&chunk_id)
+                    .with_context(|| format!("missing location for chunk {chunk_id}"))?;
+                misses.push(hint.clone());
             }
-            return Ok(bytes);
         }
-        debug!(
-            target: "protostore::reader",
-            tree_id = %self.tree_id,
-            chunk_id = %chunk_id,
-            "chunk cache miss"
-        );
-        let hint = self
-            .locations
-            .get(&chunk_id)
-            .with_context(|| format!("missing location for chunk {chunk_id}"))?;
+
+        for group in self.coalesce_misses(misses) {
+            self.fetch_group(group, &mut out).await?;
+        }
+
+        Ok(out)
+    }
+
+    fn coalesce_misses(
+        &self,
+        mut misses: Vec<crate::ChunkLocationHint>,
+    ) -> Vec<Vec<crate::ChunkLocationHint>> {
+        misses.sort_by_key(|hint| (hint.pack_id, hint.compressed_offset, hint.chunk_id));
+        let mut groups: Vec<Vec<crate::ChunkLocationHint>> = Vec::new();
+        for hint in misses {
+            let Some(current) = groups.last_mut() else {
+                groups.push(vec![hint]);
+                continue;
+            };
+            let first = current.first().unwrap();
+            let last = current.last().unwrap();
+            let current_start = first.compressed_offset;
+            let current_end = last.compressed_offset + u64::from(last.compressed_len);
+            let next_end = hint.compressed_offset + u64::from(hint.compressed_len);
+            let coalesced_len = next_end.saturating_sub(current_start);
+            if hint.pack_id == first.pack_id
+                && hint.compressed_offset >= current_end
+                && coalesced_len <= self.read_config.target_coalesce as u64
+            {
+                current.push(hint);
+            } else {
+                groups.push(vec![hint]);
+            }
+        }
+        groups
+    }
+
+    async fn fetch_group(
+        &self,
+        group: Vec<crate::ChunkLocationHint>,
+        out: &mut HashMap<crate::ChunkId, Bytes>,
+    ) -> Result<()> {
+        let first = group.first().context("empty chunk fetch group")?;
+        let last = group.last().context("empty chunk fetch group")?;
+        let range_start = first.compressed_offset;
+        let needed_end = last.compressed_offset + u64::from(last.compressed_len);
+        let pack_data_end = self
+            .pack_data_end
+            .get(&first.pack_id)
+            .copied()
+            .unwrap_or(needed_end);
+        let min_end = range_start
+            .saturating_add(self.read_config.min_remote_read as u64)
+            .min(pack_data_end);
+        let range_end = needed_end.max(min_end);
+        let range_len = range_end - range_start;
         info!(
             target: "protostore::reader",
             tree_id = %self.tree_id,
-            chunk_id = %chunk_id,
-            pack_id = %hint.pack_id,
-            compressed_offset = hint.compressed_offset,
-            compressed_len = hint.compressed_len,
-            uncompressed_len = hint.uncompressed_len,
-            "fetch compressed chunk range"
+            pack_id = %first.pack_id,
+            compressed_offset = range_start,
+            compressed_len = range_len,
+            chunk_count = group.len(),
+            target_coalesce = self.read_config.target_coalesce,
+            min_remote_read = self.read_config.min_remote_read,
+            "fetch coalesced compressed chunk range"
         );
-        let compressed = self
+        let compressed_range = self
             .store
-            .get_range(
-                &pack_key(hint.pack_id),
-                hint.compressed_offset,
-                u64::from(hint.compressed_len),
-            )
+            .get_range(&pack_key(first.pack_id), range_start, range_len)
             .await?;
-        debug!(
-            target: "protostore::reader",
-            tree_id = %self.tree_id,
-            chunk_id = %chunk_id,
-            compressed_len = compressed.len(),
-            "decompress chunk"
-        );
-        let decompressed = decompress_chunk(&compressed)?;
-        ensure!(
-            decompressed.len() == hint.uncompressed_len as usize,
-            "decompressed chunk length mismatch"
-        );
-        debug!(
-            target: "protostore::reader",
-            tree_id = %self.tree_id,
-            chunk_id = %chunk_id,
-            uncompressed_len = decompressed.len(),
-            "cache decompressed chunk"
-        );
-        self.cache.put_chunk(chunk_id, &decompressed).await?;
-        if let Some(recorder) = &self.recorder {
-            recorder.record(self.tree_id, chunk_id);
+
+        for hint in group {
+            let start = usize::try_from(hint.compressed_offset - range_start)
+                .context("coalesced range offset overflow")?;
+            let end = start
+                .checked_add(hint.compressed_len as usize)
+                .context("compressed chunk range overflow")?;
+            let compressed = compressed_range.slice(start..end);
+            debug!(
+                target: "protostore::reader",
+                tree_id = %self.tree_id,
+                chunk_id = %hint.chunk_id,
+                compressed_len = compressed.len(),
+                "decompress chunk"
+            );
+            let decompressed = decompress_chunk(&compressed)?;
+            ensure!(
+                decompressed.len() == hint.uncompressed_len as usize,
+                "decompressed chunk length mismatch"
+            );
+            debug!(
+                target: "protostore::reader",
+                tree_id = %self.tree_id,
+                chunk_id = %hint.chunk_id,
+                uncompressed_len = decompressed.len(),
+                "cache decompressed chunk"
+            );
+            self.cache.put_chunk(hint.chunk_id, &decompressed).await?;
+            if let Some(recorder) = &self.recorder {
+                recorder.record(self.tree_id, hint.chunk_id);
+            }
+            out.insert(hint.chunk_id, Bytes::from(decompressed));
         }
-        Ok(Bytes::from(decompressed))
+        Ok(())
     }
 
     pub async fn materialize(&self, output_dir: &Path) -> Result<()> {
@@ -226,4 +384,11 @@ impl<S: BlobStore> TreeReader<S> {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectedChunk {
+    chunk_id: crate::ChunkId,
+    take_start: usize,
+    take_end: usize,
 }

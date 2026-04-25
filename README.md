@@ -22,9 +22,9 @@ No CI executor, action keys, checkpoints, writable overlays, GC, inline small-fi
 ## Local Quickstart
 
 ```bash
-cargo run -p protostore-cli -- pack ./examples/data --store file:///tmp/protostore-store
+cargo run -p protostore-cli -- pack ./examples/data --store file:///tmp/protostore-store --chunk-size 16MiB --pack-workers 8
 cargo run -p protostore-cli -- inspect <tree-id> --store file:///tmp/protostore-store
-cargo run -p protostore-cli -- materialize <tree-id> /tmp/protostore-out --store file:///tmp/protostore-store
+cargo run -p protostore-cli -- materialize <tree-id> /tmp/protostore-out --store file:///tmp/protostore-store --target-coalesce 64MiB
 ```
 
 For FUSE:
@@ -33,6 +33,14 @@ For FUSE:
 mkdir -p /tmp/protostore-mnt
 cargo run -p protostore-cli -- mount <tree-id> /tmp/protostore-mnt --store file:///tmp/protostore-store
 cat /tmp/protostore-mnt/some-file
+```
+
+Useful size flags accept plain bytes or `KiB`/`MiB`/`GiB` suffixes:
+
+```bash
+protostore pack <dir> --store file:///tmp/store --chunk-size 16MiB --pack-target-size 128MiB --pack-workers 8
+protostore mount <tree-id> <mnt> --store file:///tmp/store --min-remote-read 16MiB --target-coalesce 64MiB
+protostore materialize <tree-id> <out> --store file:///tmp/store --min-remote-read 16MiB --target-coalesce 64MiB
 ```
 
 ## Storage Layout
@@ -54,13 +62,25 @@ Pack blobs use a fixed header, independently compressed zstd chunk frames, a JSO
 
 Implementation note: the original MVP spec put `pack_id` inside the hashed pack index while also defining `pack_id` as the hash of the full pack bytes. This implementation skips serializing `pack_id` inside the index and fills it from the pack key when reading.
 
+Packing uses bounded `tokio-uring` workers on Linux to read files and compute chunk hashes/compression concurrently. The CLI defaults `--pack-workers` to the number of available CPU threads. Worker results are reassembled in deterministic path order before packs are written, so parallelism does not change tree identity for the same inputs and pack config.
+
 ## Lazy Reads And FUSE
 
-`TreeReader` maps logical file ranges to chunk references, resolves chunk location hints, reads compressed pack ranges from object storage, decompresses only required chunks, and stores decompressed chunks in the local disposable cache. The FUSE crate is intentionally thin and delegates file content reads to `TreeReader`.
+`TreeReader` maps logical file ranges to chunk references, resolves chunk location hints, coalesces adjacent compressed chunk reads from the same pack, decompresses selected chunks, and stores decompressed chunks in the local disposable cache. The FUSE crate is intentionally thin and delegates file content reads to `TreeReader`.
+
+Enable tracing to inspect lazy reads:
+
+```bash
+rm -rf .protostore-cache
+RUST_LOG='protostore::reader=debug,protostore::object_store=debug' \
+  protostore mount <tree-id> <mnt> --store file:///tmp/store
+```
+
+Look for `read_at selected chunk`, `fetch coalesced compressed chunk range`, `object range read`, `decompress chunk`, and `chunk cache hit`.
 
 ## Known Limitations
 
 - `file://` stores are implemented first; S3/GCS/Azure URI parsing is not wired yet.
-- Pack index loading currently fetches the full pack before parsing the footer, while file-content reads use exact ranges.
+- Pack index loading currently fetches the full pack before parsing the footer, while file-content reads use coalesced compressed chunk ranges.
 - Access profiles are implemented in core, but the CLI does not yet expose explicit profiling flags for materialize/read.
 - Embedded location hints mean repacking creates a new tree ID in the MVP.

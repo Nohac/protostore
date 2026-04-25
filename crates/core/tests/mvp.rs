@@ -1,7 +1,8 @@
 use protostore_core::{
-    BlobStore, ChunkId, FileChunkRef, FileNode, Hash32, LocalCache, ObjectBlobStore,
+    BlobStore, ChunkId, FileChunkRef, FileNode, Hash32, LocalCache, ObjectBlobStore, PackConfig,
     ProfileRecorder, TreeId, TreeManifest, TreeReader,
     pack::{FOOTER_LEN, compress_chunk, decompress_chunk, encode_pack, parse_footer},
+    pack_directory_with_config,
     profile::write_profile,
     tree::{load_tree, pack_directory, repack_tree, tree_id},
 };
@@ -82,7 +83,17 @@ async fn range_read_spanning_multiple_chunks() {
     bytes.extend_from_slice(b"boundary");
     write(&input.path().join("large.bin"), &bytes);
     let store = local_store(&store_dir);
-    let tree_id = pack_directory(&store, input.path()).await.unwrap();
+    let tree_id = pack_directory_with_config(
+        &store,
+        input.path(),
+        PackConfig {
+            chunk_size: 4 * 1024 * 1024,
+            pack_target_size: 128 * 1024 * 1024,
+            pack_workers: 2,
+        },
+    )
+    .await
+    .unwrap();
     let reader = TreeReader::open(store, tree_id, LocalCache::new(cache_dir.path()))
         .await
         .unwrap();

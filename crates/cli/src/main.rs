@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command};
 use protostore_core::{
-    LocalCache, ObjectBlobStore, ProfileId, TreeId, inspect_tree, materialize_tree, pack_directory,
-    repack_tree,
+    LocalCache, ObjectBlobStore, PackConfig, ProfileId, ReadConfig, TreeId, inspect_tree,
+    materialize_tree_with_config, pack_directory_with_config, repack_tree,
 };
 use std::{path::Path, str::FromStr, thread, time::Duration};
 use tracing_subscriber::EnvFilter;
@@ -17,10 +17,18 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Pack { directory, store } => {
+        Command::Pack {
+            directory,
+            store,
+            chunk_size,
+            pack_target_size,
+            pack_workers,
+        } => {
             let store = ObjectBlobStore::from_uri(&store)?;
+            let pack_config = pack_config(chunk_size, pack_target_size, pack_workers)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
-            let tree_id = runtime.block_on(pack_directory(&store, &directory))?;
+            let tree_id =
+                runtime.block_on(pack_directory_with_config(&store, &directory, pack_config))?;
             println!("{tree_id}");
         }
         Command::Inspect { tree_id, store } => {
@@ -34,13 +42,17 @@ fn main() -> Result<()> {
             tree_id,
             mountpoint,
             store,
+            min_remote_read,
+            target_coalesce,
         } => {
             let tree_id = TreeId::from_str(&tree_id).context("parsing tree id")?;
             let store = ObjectBlobStore::from_uri(&store)?;
+            let read_config = read_config(min_remote_read, target_coalesce)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
             let session = protostore_fuse::ProtoStoreFuseBuilder::new(store, tree_id)
                 .runtime_handle(runtime.handle().clone())
                 .cache(LocalCache::disposable_default())
+                .read_config(read_config)
                 .spawn(&mountpoint)?;
             eprintln!("mounted {}. Press Ctrl-C to unmount.", mountpoint.display());
             runtime
@@ -68,15 +80,19 @@ fn main() -> Result<()> {
             tree_id,
             output_dir,
             store,
+            min_remote_read,
+            target_coalesce,
         } => {
             let tree_id = TreeId::from_str(&tree_id).context("parsing tree id")?;
             let store = ObjectBlobStore::from_uri(&store)?;
+            let read_config = read_config(min_remote_read, target_coalesce)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
-            runtime.block_on(materialize_tree(
+            runtime.block_on(materialize_tree_with_config(
                 store,
                 tree_id,
                 &output_dir,
                 LocalCache::disposable_default(),
+                read_config,
             ))?;
         }
         Command::Repack {
@@ -116,4 +132,59 @@ fn unescape_mountinfo_path(path: &str) -> String {
         .replace("\\011", "\t")
         .replace("\\012", "\n")
         .replace("\\134", "\\")
+}
+
+fn pack_config(
+    chunk_size: Option<usize>,
+    pack_target_size: Option<usize>,
+    pack_workers: Option<usize>,
+) -> Result<PackConfig> {
+    let defaults = PackConfig::default();
+    let chunk_size = chunk_size.unwrap_or(defaults.chunk_size);
+    PackConfig {
+        chunk_size,
+        pack_target_size: pack_target_size.unwrap_or(defaults.pack_target_size.max(chunk_size)),
+        pack_workers: pack_workers.unwrap_or(defaults.pack_workers),
+    }
+    .validate()
+}
+
+fn read_config(
+    min_remote_read: Option<usize>,
+    target_coalesce: Option<usize>,
+) -> Result<ReadConfig> {
+    let defaults = ReadConfig::default();
+    let min_remote_read = min_remote_read.unwrap_or(defaults.min_remote_read);
+    ReadConfig {
+        min_remote_read,
+        target_coalesce: target_coalesce.unwrap_or(defaults.target_coalesce.max(min_remote_read)),
+    }
+    .validate()
+}
+
+fn parse_size(value: &str) -> std::result::Result<usize, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("size cannot be empty".to_string());
+    }
+    let split_at = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, suffix) = value.split_at(split_at);
+    if digits.is_empty() {
+        return Err(format!("size must start with digits: {value}"));
+    }
+    let number: usize = digits
+        .parse()
+        .map_err(|err| format!("invalid size number {digits}: {err}"))?;
+    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1usize,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        other => return Err(format!("unsupported size suffix: {other}")),
+    };
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("size is too large: {value}"))
 }
