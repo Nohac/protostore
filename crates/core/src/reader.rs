@@ -1,7 +1,7 @@
 use crate::{
     cache::LocalCache,
     hash::TreeId,
-    pack::{decompress_chunk, pack_key},
+    pack::decompress_chunk,
     profile::ProfileRecorder,
     store::BlobStore,
     tree::{
@@ -23,7 +23,7 @@ pub struct TreeReader<S> {
     layout: LayoutManifest,
     files: HashMap<String, FileNode>,
     locations: HashMap<crate::ChunkId, crate::ChunkLocationHint>,
-    pack_data_end: HashMap<crate::PackId, u64>,
+    pack_data_end: HashMap<String, u64>,
     cache: LocalCache,
     recorder: Option<ProfileRecorder>,
     read_config: ReadConfig,
@@ -123,11 +123,11 @@ impl<S: BlobStore> TreeReader<S> {
             tree_id
         );
         let locations = location_map(&layout);
-        let mut pack_data_end = HashMap::<crate::PackId, u64>::new();
+        let mut pack_data_end = HashMap::<String, u64>::new();
         for hint in &layout.locations {
             let end = hint.compressed_offset + u64::from(hint.compressed_len);
             pack_data_end
-                .entry(hint.pack_id)
+                .entry(hint.pack_key.clone())
                 .and_modify(|current| *current = (*current).max(end))
                 .or_insert(end);
         }
@@ -278,7 +278,7 @@ impl<S: BlobStore> TreeReader<S> {
         &self,
         mut misses: Vec<crate::ChunkLocationHint>,
     ) -> Vec<Vec<crate::ChunkLocationHint>> {
-        misses.sort_by_key(|hint| (hint.pack_id, hint.compressed_offset, hint.chunk_id));
+        misses.sort_by_key(|hint| (hint.pack_key.clone(), hint.compressed_offset, hint.chunk_id));
         let mut groups: Vec<Vec<crate::ChunkLocationHint>> = Vec::new();
         for hint in misses {
             let Some(current) = groups.last_mut() else {
@@ -291,7 +291,7 @@ impl<S: BlobStore> TreeReader<S> {
             let current_end = last.compressed_offset + u64::from(last.compressed_len);
             let next_end = hint.compressed_offset + u64::from(hint.compressed_len);
             let coalesced_len = next_end.saturating_sub(current_start);
-            if hint.pack_id == first.pack_id
+            if hint.pack_key == first.pack_key
                 && hint.compressed_offset >= current_end
                 && coalesced_len <= self.read_config.target_coalesce as u64
             {
@@ -314,7 +314,7 @@ impl<S: BlobStore> TreeReader<S> {
         let needed_end = last.compressed_offset + u64::from(last.compressed_len);
         let pack_data_end = self
             .pack_data_end
-            .get(&first.pack_id)
+            .get(&first.pack_key)
             .copied()
             .unwrap_or(needed_end);
         let min_end = range_start
@@ -325,7 +325,8 @@ impl<S: BlobStore> TreeReader<S> {
         info!(
             target: "protostore::reader",
             tree_id = %self.tree_id,
-            pack_id = %first.pack_id,
+            pack_key = %first.pack_key,
+            pack_hash = %first.pack_hash,
             compressed_offset = range_start,
             compressed_len = range_len,
             chunk_count = group.len(),
@@ -335,7 +336,7 @@ impl<S: BlobStore> TreeReader<S> {
         );
         let compressed_range = self
             .store
-            .get_range(&pack_key(first.pack_id), range_start, range_len)
+            .get_range(&first.pack_key, range_start, range_len)
             .await?;
 
         for hint in group {

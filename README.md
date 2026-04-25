@@ -38,7 +38,7 @@ cat /tmp/protostore-mnt/some-file
 Useful size flags accept plain bytes or `KiB`/`MiB`/`GiB` suffixes:
 
 ```bash
-protostore pack <dir> --store file:///tmp/store --chunk-size 16MiB --pack-target-size 128MiB --pack-workers 8
+protostore pack <dir> --store file:///tmp/store --chunk-size 16MiB --pack-target-size 128MiB --pack-workers 8 --key cargo-cache/<cache-key>
 protostore mount <tree-id> <mnt> --store file:///tmp/store --min-remote-read 16MiB --target-coalesce 64MiB
 protostore materialize <tree-id> <out> --store file:///tmp/store --min-remote-read 16MiB --target-coalesce 64MiB
 ```
@@ -48,7 +48,7 @@ protostore materialize <tree-id> <out> --store file:///tmp/store --min-remote-re
 All durable state lives under object-store keys:
 
 ```text
-packs/<pack-id>.pack
+packs/<pack-key>/<seq>.pack
 trees/<tree-id>.tree
 layouts/<layout-id>.layout
 profiles/<profile-id>.profile
@@ -59,9 +59,9 @@ Local disk is disposable cache only, currently `.protostore-cache/chunks/<chunk-
 
 ## Pack Format
 
-Pack blobs use a fixed header, independently compressed zstd chunk frames, a JSON index, and a fixed footer. Tree manifests describe logical files and chunk IDs. Layout manifests map chunk IDs to physical pack offsets. Readers parse the footer, verify the index hash, resolve chunk offsets through the layout, then range-read only the compressed chunk frames needed for a file read.
+Pack blobs use a fixed header, independently compressed zstd chunk frames, a JSON index, and a fixed footer. Tree manifests describe logical files and chunk IDs. Layout manifests map chunk IDs to physical pack object keys and offsets. Readers parse the footer, verify the index hash, resolve chunk offsets through the layout, then range-read only the compressed chunk frames needed for a file read.
 
-Implementation note: the original MVP spec put `pack_id` inside the hashed pack index while also defining `pack_id` as the hash of the full pack bytes. This implementation skips serializing `pack_id` inside the index and fills it from the pack key when reading.
+Pack objects are written directly to their final blob keys. `--key` controls the physical prefix below `packs/`; if omitted, the CLI uses a generated UUIDv7 prefix. Layouts store the full pack hash for integrity instead of requiring content-addressed pack object names.
 
 Packing uses bounded `tokio-uring` workers on Linux to read files and compute chunk hashes/compression concurrently. The CLI defaults `--pack-workers` to the number of available CPU threads. Tree identity is based on logical file content; physical pack layout is stored separately in a layout object.
 

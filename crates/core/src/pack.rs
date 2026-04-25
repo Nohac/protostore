@@ -124,6 +124,14 @@ pub fn read_pack_index_from_bytes(bytes: &[u8]) -> Result<PackIndex> {
 
 pub async fn read_pack_index<S: BlobStore>(store: &S, pack_id: PackId) -> Result<PackIndex> {
     let key = pack_key(pack_id);
+    read_pack_index_by_key(store, &key, pack_id).await
+}
+
+pub async fn read_pack_index_by_key<S: BlobStore>(
+    store: &S,
+    key: &str,
+    pack_id: PackId,
+) -> Result<PackIndex> {
     let pack = store.get_bytes(&key).await?;
     let start = pack
         .len()
@@ -152,9 +160,17 @@ pub async fn read_chunk_from_pack<S: BlobStore>(
     pack_id: PackId,
     entry: &ChunkEntry,
 ) -> Result<Bytes> {
+    read_chunk_from_pack_key(store, &pack_key(pack_id), entry).await
+}
+
+pub async fn read_chunk_from_pack_key<S: BlobStore>(
+    store: &S,
+    pack_key: &str,
+    entry: &ChunkEntry,
+) -> Result<Bytes> {
     let compressed = store
         .get_range(
-            &pack_key(pack_id),
+            pack_key,
             entry.compressed_offset,
             u64::from(entry.compressed_len),
         )
@@ -177,6 +193,71 @@ pub fn index_by_chunk(index: &PackIndex) -> HashMap<ChunkId, ChunkEntry> {
 
 pub fn pack_key(pack_id: PackId) -> String {
     format!("packs/{pack_id}.pack")
+}
+
+pub async fn stream_pack_to_key<S: BlobStore>(
+    store: &S,
+    key: &str,
+    chunks: Vec<(ChunkId, Vec<u8>, u32)>,
+    part_size: usize,
+) -> Result<(PackId, PackIndex)> {
+    let mut upload = store.begin_multipart(key, part_size).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut offset = 0u64;
+
+    let mut header = BytesMut::new();
+    header.extend_from_slice(PACK_MAGIC);
+    header.put_u32_le(PACK_VERSION);
+    header.put_u32_le(0);
+    offset += header.len() as u64;
+    put_pack_bytes(&mut upload, &mut hasher, header.freeze()).await?;
+
+    let mut entries = Vec::with_capacity(chunks.len());
+    for (chunk_id, compressed, uncompressed_len) in chunks {
+        let compressed_len =
+            u32::try_from(compressed.len()).context("compressed chunk too large")?;
+        entries.push(ChunkEntry {
+            chunk_id,
+            compressed_offset: offset,
+            compressed_len,
+            uncompressed_len,
+            compression: Compression::Zstd,
+        });
+        offset += u64::from(compressed_len);
+        put_pack_bytes(&mut upload, &mut hasher, Bytes::from(compressed)).await?;
+    }
+
+    let index_offset = offset;
+    let index = PackIndex {
+        version: PACK_VERSION,
+        pack_id: PackId::zero(),
+        chunks: entries,
+    };
+    let index_bytes = Bytes::from(serde_json::to_vec(&index).context("serialize pack index")?);
+    let index_hash = Hash32::digest(&index_bytes);
+    put_pack_bytes(&mut upload, &mut hasher, index_bytes.clone()).await?;
+
+    let mut footer = BytesMut::new();
+    footer.put_u64_le(index_offset);
+    footer.put_u64_le(index_bytes.len() as u64);
+    footer.extend_from_slice(&index_hash.0);
+    footer.extend_from_slice(FOOTER_MAGIC);
+    put_pack_bytes(&mut upload, &mut hasher, footer.freeze()).await?;
+
+    upload.finish().await?;
+    let pack_id = PackId::new(Hash32(*hasher.finalize().as_bytes()));
+    let mut index = index;
+    index.pack_id = pack_id;
+    Ok((pack_id, index))
+}
+
+async fn put_pack_bytes(
+    upload: &mut Box<dyn crate::store::BlobUpload>,
+    hasher: &mut blake3::Hasher,
+    bytes: Bytes,
+) -> Result<()> {
+    hasher.update(&bytes);
+    upload.put(bytes).await
 }
 
 pub fn parse_footer(bytes: &[u8]) -> Result<(u64, u64, Hash32)> {

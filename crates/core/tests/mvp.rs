@@ -89,6 +89,7 @@ async fn range_read_spanning_multiple_chunks() {
             chunk_size: 4 * 1024 * 1024,
             pack_target_size: 128 * 1024 * 1024,
             pack_workers: 2,
+            pack_key_prefix: "test-large".to_string(),
         },
     )
     .await

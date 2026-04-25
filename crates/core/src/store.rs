@@ -2,7 +2,8 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::{
-    ObjectStore, ObjectStoreExt, PutPayload, local::LocalFileSystem, path::Path as ObjectPath,
+    ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart, local::LocalFileSystem,
+    path::Path as ObjectPath,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{path::PathBuf, sync::Arc};
@@ -11,6 +12,7 @@ use tracing::debug;
 #[async_trait]
 pub trait BlobStore: Send + Sync + Clone + 'static {
     async fn put_bytes(&self, key: &str, bytes: Bytes) -> Result<()>;
+    async fn begin_multipart(&self, key: &str, part_size: usize) -> Result<Box<dyn BlobUpload>>;
     async fn get_bytes(&self, key: &str) -> Result<Bytes>;
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes>;
     async fn exists(&self, key: &str) -> Result<bool>;
@@ -24,6 +26,13 @@ pub trait BlobStore: Send + Sync + Clone + 'static {
         let bytes = self.get_bytes(key).await?;
         serde_json::from_slice(&bytes).with_context(|| format!("deserializing {key}"))
     }
+}
+
+#[async_trait]
+pub trait BlobUpload: Send {
+    async fn put(&mut self, bytes: Bytes) -> Result<()>;
+    async fn finish(self: Box<Self>) -> Result<()>;
+    async fn abort(self: Box<Self>) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -60,6 +69,17 @@ impl BlobStore for ObjectBlobStore {
         Ok(())
     }
 
+    async fn begin_multipart(&self, key: &str, part_size: usize) -> Result<Box<dyn BlobUpload>> {
+        let upload = self
+            .inner
+            .put_multipart(&ObjectPath::from(key))
+            .await
+            .with_context(|| format!("begin multipart upload {key}"))?;
+        Ok(Box::new(ObjectBlobUpload {
+            inner: WriteMultipart::new_with_chunk_size(upload, part_size),
+        }))
+    }
+
     async fn get_bytes(&self, key: &str) -> Result<Bytes> {
         let result = self
             .inner
@@ -94,5 +114,28 @@ impl BlobStore for ObjectBlobStore {
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(err) => Err(err).with_context(|| format!("head object {key}")),
         }
+    }
+}
+
+struct ObjectBlobUpload {
+    inner: WriteMultipart,
+}
+
+#[async_trait]
+impl BlobUpload for ObjectBlobUpload {
+    async fn put(&mut self, bytes: Bytes) -> Result<()> {
+        self.inner.wait_for_capacity(4).await?;
+        self.inner.put(bytes);
+        Ok(())
+    }
+
+    async fn finish(self: Box<Self>) -> Result<()> {
+        self.inner.finish().await?;
+        Ok(())
+    }
+
+    async fn abort(self: Box<Self>) -> Result<()> {
+        self.inner.abort().await?;
+        Ok(())
     }
 }

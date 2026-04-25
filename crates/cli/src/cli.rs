@@ -24,6 +24,11 @@ pub enum Command {
             help = "Number of parallel pack workers. Defaults to available CPU threads."
         )]
         pack_workers: Option<usize>,
+        #[arg(
+            long,
+            help = "Physical pack key prefix under packs/. Defaults to a UUIDv7."
+        )]
+        key: Option<String>,
     },
     Inspect {
         tree_id: String,

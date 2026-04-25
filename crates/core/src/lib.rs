@@ -11,7 +11,7 @@ pub use hash::{ChunkId, Hash32, LayoutId, PackId, ProfileId, TreeId};
 pub use pack::{ChunkEntry, Compression, PackIndex};
 pub use profile::{AccessEvent, AccessProfile, ProfileRecorder};
 pub use reader::{ReadConfig, TreeReader};
-pub use store::{BlobStore, ObjectBlobStore};
+pub use store::{BlobStore, BlobUpload, ObjectBlobStore};
 pub use tree::{
     ChunkLocationHint, FileChunkRef, FileNode, LayoutManifest, PackConfig, TreeManifest,
     inspect_tree, materialize_tree, materialize_tree_with_config, pack_directory,

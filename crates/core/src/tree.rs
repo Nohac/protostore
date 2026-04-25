@@ -1,7 +1,7 @@
 use crate::{
     cache::LocalCache,
-    hash::{ChunkId, Hash32, LayoutId, PackId, ProfileId, TreeId},
-    pack::{ChunkEntry, Compression, compress_chunk, encode_pack, pack_key, read_chunk_from_pack},
+    hash::{ChunkId, Hash32, LayoutId, ProfileId, TreeId},
+    pack::{ChunkEntry, Compression, compress_chunk, read_chunk_from_pack_key, stream_pack_to_key},
     profile::load_profile,
     reader::{ReadConfig, TreeReader},
     store::BlobStore,
@@ -22,11 +22,12 @@ use walkdir::WalkDir;
 pub const DEFAULT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 pub const PACK_TARGET_SIZE: usize = 128 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackConfig {
     pub chunk_size: usize,
     pub pack_target_size: usize,
     pub pack_workers: usize,
+    pub pack_key_prefix: String,
 }
 
 impl Default for PackConfig {
@@ -35,6 +36,7 @@ impl Default for PackConfig {
             chunk_size: DEFAULT_CHUNK_SIZE,
             pack_target_size: PACK_TARGET_SIZE,
             pack_workers: default_pack_workers(),
+            pack_key_prefix: generated_pack_key_prefix(),
         }
     }
 }
@@ -54,8 +56,24 @@ impl PackConfig {
             self.pack_workers > 0,
             "pack workers must be greater than zero"
         );
+        ensure!(
+            valid_pack_key_prefix(&self.pack_key_prefix),
+            "pack key must be relative and must not contain empty path segments or '..'"
+        );
         Ok(self)
     }
+}
+
+fn generated_pack_key_prefix() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+fn valid_pack_key_prefix(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && value
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
 fn default_pack_workers() -> usize {
@@ -103,7 +121,8 @@ pub struct FileChunkRef {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkLocationHint {
     pub chunk_id: ChunkId,
-    pub pack_id: PackId,
+    pub pack_key: String,
+    pub pack_hash: Hash32,
     pub compressed_offset: u64,
     pub compressed_len: u32,
     pub uncompressed_len: u32,
@@ -237,7 +256,7 @@ pub async fn pack_directory_with_config<S: BlobStore>(
             append_packed_file(
                 store,
                 packed,
-                config.pack_target_size,
+                &config,
                 &mut files,
                 &mut pending,
                 &mut pending_compressed_len,
@@ -254,13 +273,14 @@ pub async fn pack_directory_with_config<S: BlobStore>(
 
     flush_pack(
         store,
+        &config,
         &mut pending,
         &mut pending_compressed_len,
         &mut locations,
     )
     .await?;
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    locations.sort_by_key(|hint| (hint.pack_id, hint.compressed_offset, hint.chunk_id));
+    locations.sort_by_key(|hint| (hint.pack_key.clone(), hint.compressed_offset, hint.chunk_id));
     let tree = LogicalTreeManifest { version: 1, files };
     write_tree(store, &tree, locations).await
 }
@@ -268,7 +288,7 @@ pub async fn pack_directory_with_config<S: BlobStore>(
 async fn append_packed_file<S: BlobStore>(
     store: &S,
     packed: PackedFile,
-    pack_target_size: usize,
+    config: &PackConfig,
     files: &mut Vec<FileNode>,
     pending: &mut Vec<(ChunkId, Vec<u8>, u32)>,
     pending_compressed_len: &mut usize,
@@ -277,8 +297,8 @@ async fn append_packed_file<S: BlobStore>(
     for chunk in packed.compressed_chunks {
         *pending_compressed_len += chunk.compressed.len();
         pending.push((chunk.chunk_id, chunk.compressed, chunk.uncompressed_len));
-        if *pending_compressed_len >= pack_target_size {
-            flush_pack(store, pending, pending_compressed_len, locations).await?;
+        if *pending_compressed_len >= config.pack_target_size {
+            flush_pack(store, config, pending, pending_compressed_len, locations).await?;
         }
     }
     files.push(packed.file);
@@ -458,6 +478,7 @@ struct CompressedChunk {
 
 async fn flush_pack<S: BlobStore>(
     store: &S,
+    config: &PackConfig,
     pending: &mut Vec<(ChunkId, Vec<u8>, u32)>,
     pending_compressed_len: &mut usize,
     locations: &mut Vec<ChunkLocationHint>,
@@ -465,22 +486,32 @@ async fn flush_pack<S: BlobStore>(
     if pending.is_empty() {
         return Ok(());
     }
-    let encoded = encode_pack(pending)?;
-    store
-        .put_bytes(&pack_key(encoded.pack_id), encoded.bytes)
-        .await?;
-    for entry in encoded.index.chunks {
+    let chunks = std::mem::take(pending);
+    let key = next_pack_key(config, locations);
+    let (pack_id, index) =
+        stream_pack_to_key(store, &key, chunks, PACK_TARGET_SIZE.min(64 * 1024 * 1024)).await?;
+    let pack_hash = pack_id.0;
+    for entry in index.chunks {
         locations.push(ChunkLocationHint {
             chunk_id: entry.chunk_id,
-            pack_id: encoded.pack_id,
+            pack_key: key.clone(),
+            pack_hash,
             compressed_offset: entry.compressed_offset,
             compressed_len: entry.compressed_len,
             uncompressed_len: entry.uncompressed_len,
         });
     }
-    pending.clear();
     *pending_compressed_len = 0;
     Ok(())
+}
+
+fn next_pack_key(config: &PackConfig, locations: &[ChunkLocationHint]) -> String {
+    let pack_index = locations
+        .iter()
+        .map(|hint| hint.pack_key.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    format!("packs/{}/{pack_index:06}.pack", config.pack_key_prefix)
 }
 
 pub fn inspect_tree(tree_id: TreeId, tree: &TreeManifest, layout: &LayoutManifest) -> String {
@@ -581,7 +612,7 @@ pub async fn repack_tree_with_config<S: BlobStore>(
             uncompressed_len: hint.uncompressed_len,
             compression: Compression::Zstd,
         };
-        let decompressed = read_chunk_from_pack(store, hint.pack_id, &entry).await?;
+        let decompressed = read_chunk_from_pack_key(store, &hint.pack_key, &entry).await?;
         ensure!(
             ChunkId::new(Hash32::digest(&decompressed)) == chunk_id,
             "chunk hash mismatch while repacking {chunk_id}"
@@ -590,11 +621,26 @@ pub async fn repack_tree_with_config<S: BlobStore>(
         pending_len += compressed.len();
         pending.push((chunk_id, compressed, hint.uncompressed_len));
         if pending_len >= config.pack_target_size {
-            flush_pack(store, &mut pending, &mut pending_len, &mut new_locations).await?;
+            flush_pack(
+                store,
+                &config,
+                &mut pending,
+                &mut pending_len,
+                &mut new_locations,
+            )
+            .await?;
         }
     }
-    flush_pack(store, &mut pending, &mut pending_len, &mut new_locations).await?;
-    new_locations.sort_by_key(|hint| (hint.pack_id, hint.compressed_offset, hint.chunk_id));
+    flush_pack(
+        store,
+        &config,
+        &mut pending,
+        &mut pending_len,
+        &mut new_locations,
+    )
+    .await?;
+    new_locations
+        .sort_by_key(|hint| (hint.pack_key.clone(), hint.compressed_offset, hint.chunk_id));
     let new_layout = LayoutManifest {
         version: 1,
         tree_id,
