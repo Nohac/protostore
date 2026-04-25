@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyOpen, Request,
+    BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
+    ReplyDirectory, ReplyEntry, ReplyOpen, Request,
 };
 use protostore_core::{BlobStore, LocalCache, TreeId, TreeReader};
 use std::{
@@ -10,10 +10,95 @@ use std::{
     path::Path,
     time::{Duration, SystemTime},
 };
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INO: u64 = 1;
+
+pub struct ProtoStoreFuseBuilder<S> {
+    store: S,
+    tree_id: TreeId,
+    cache: LocalCache,
+    runtime: Option<Handle>,
+    fs_name: String,
+    default_permissions: bool,
+}
+
+impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
+    pub fn new(store: S, tree_id: TreeId) -> Self {
+        Self {
+            store,
+            tree_id,
+            cache: LocalCache::disposable_default(),
+            runtime: None,
+            fs_name: "protostore".to_string(),
+            default_permissions: true,
+        }
+    }
+
+    pub fn runtime_handle(mut self, runtime: Handle) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    pub fn cache(mut self, cache: LocalCache) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    pub fn fs_name(mut self, fs_name: impl Into<String>) -> Self {
+        self.fs_name = fs_name.into();
+        self
+    }
+
+    pub fn default_permissions(mut self, default_permissions: bool) -> Self {
+        self.default_permissions = default_permissions;
+        self
+    }
+
+    fn into_filesystem(self) -> Result<(ProtoStoreFs<S>, Vec<MountOption>)> {
+        let runtime = self
+            .runtime
+            .context("FUSE builder requires a Tokio runtime handle")?;
+        let reader = runtime
+            .block_on(TreeReader::open(self.store, self.tree_id, self.cache))
+            .context("opening tree reader for FUSE")?;
+        let fs = ProtoStoreFs::new(runtime, reader);
+        let mut options = vec![MountOption::RO, MountOption::FSName(self.fs_name)];
+        if self.default_permissions {
+            options.push(MountOption::DefaultPermissions);
+        }
+        Ok((fs, options))
+    }
+
+    pub fn mount(self, mountpoint: &Path) -> Result<()> {
+        let (fs, options) = self.into_filesystem()?;
+        fuser::mount2(fs, mountpoint, &options)
+            .with_context(|| format!("mounting {}", mountpoint.display()))
+    }
+
+    pub fn spawn(self, mountpoint: &Path) -> Result<BackgroundSession>
+    where
+        S: Send + 'static,
+    {
+        let (fs, options) = self.into_filesystem()?;
+        fuser::spawn_mount2(fs, mountpoint, &options)
+            .with_context(|| format!("mounting {}", mountpoint.display()))
+    }
+}
+
+pub fn mount_readonly_with_runtime<S: BlobStore>(
+    runtime: Handle,
+    store: S,
+    tree_id: TreeId,
+    mountpoint: &Path,
+    cache: LocalCache,
+) -> Result<()> {
+    ProtoStoreFuseBuilder::new(store, tree_id)
+        .runtime_handle(runtime)
+        .cache(cache)
+        .mount(mountpoint)
+}
 
 #[derive(Clone)]
 struct Node {
@@ -26,38 +111,15 @@ struct Node {
     children: BTreeMap<OsString, u64>,
 }
 
-pub fn mount_readonly<S: BlobStore>(
-    store: S,
-    tree_id: TreeId,
-    mountpoint: &Path,
-    cache: LocalCache,
-) -> Result<()> {
-    let runtime = Runtime::new().context("creating FUSE runtime")?;
-    let reader = runtime
-        .block_on(TreeReader::open(store, tree_id, cache))
-        .context("opening tree reader for FUSE")?;
-    let fs = ProtoStoreFs::new(runtime, reader);
-    fuser::mount2(
-        fs,
-        mountpoint,
-        &[
-            MountOption::RO,
-            MountOption::FSName("protostore".to_string()),
-            MountOption::DefaultPermissions,
-        ],
-    )
-    .with_context(|| format!("mounting {}", mountpoint.display()))
-}
-
 struct ProtoStoreFs<S> {
-    runtime: Runtime,
+    runtime: Handle,
     reader: TreeReader<S>,
     nodes: HashMap<u64, Node>,
     by_parent_name: HashMap<(u64, OsString), u64>,
 }
 
 impl<S: BlobStore> ProtoStoreFs<S> {
-    fn new(runtime: Runtime, reader: TreeReader<S>) -> Self {
+    fn new(runtime: Handle, reader: TreeReader<S>) -> Self {
         let mut nodes = HashMap::new();
         let mut by_parent_name = HashMap::new();
         nodes.insert(

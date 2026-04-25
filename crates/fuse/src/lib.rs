@@ -1,3 +1,3 @@
 pub mod mount;
 
-pub use mount::mount_readonly;
+pub use mount::{ProtoStoreFuseBuilder, mount_readonly_with_runtime};

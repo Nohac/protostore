@@ -6,6 +6,7 @@ use object_store::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{path::PathBuf, sync::Arc};
+use tracing::debug;
 
 #[async_trait]
 pub trait BlobStore: Send + Sync + Clone + 'static {
@@ -73,6 +74,14 @@ impl BlobStore for ObjectBlobStore {
 
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes> {
         let end = offset.checked_add(len).context("range end overflow")?;
+        debug!(
+            target: "protostore::object_store",
+            key,
+            offset,
+            len,
+            end,
+            "object range read"
+        );
         self.inner
             .get_range(&ObjectPath::from(key), offset..end)
             .await
