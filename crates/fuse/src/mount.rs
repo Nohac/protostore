@@ -3,7 +3,7 @@ use fuser::{
     BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
     ReplyDirectory, ReplyEntry, ReplyOpen, Request,
 };
-use protostore_core::{BlobStore, LocalCache, ReadConfig, TreeId, TreeReader};
+use protostore_core::{BlobStore, LocalCache, ReadConfig, TreeReader};
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::{OsStr, OsString},
@@ -17,7 +17,7 @@ const ROOT_INO: u64 = 1;
 
 pub struct ProtoStoreFuseBuilder<S> {
     store: S,
-    tree_id: TreeId,
+    key: String,
     cache: LocalCache,
     read_config: ReadConfig,
     runtime: Option<Handle>,
@@ -26,10 +26,10 @@ pub struct ProtoStoreFuseBuilder<S> {
 }
 
 impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
-    pub fn new(store: S, tree_id: TreeId) -> Self {
+    pub fn new(store: S, key: impl Into<String>) -> Self {
         Self {
             store,
-            tree_id,
+            key: key.into(),
             cache: LocalCache::disposable_default(),
             read_config: ReadConfig::default(),
             runtime: None,
@@ -70,7 +70,7 @@ impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
         let reader = runtime
             .block_on(TreeReader::open_with_config(
                 self.store,
-                self.tree_id,
+                self.key,
                 self.cache,
                 self.read_config,
             ))
@@ -102,12 +102,12 @@ impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
 pub fn mount_readonly_with_runtime<S: BlobStore>(
     runtime: Handle,
     store: S,
-    tree_id: TreeId,
+    key: impl Into<String>,
     mountpoint: &Path,
     cache: LocalCache,
     read_config: ReadConfig,
 ) -> Result<()> {
-    ProtoStoreFuseBuilder::new(store, tree_id)
+    ProtoStoreFuseBuilder::new(store, key)
         .runtime_handle(runtime)
         .cache(cache)
         .read_config(read_config)

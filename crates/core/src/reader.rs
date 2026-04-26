@@ -59,18 +59,20 @@ impl ReadConfig {
 }
 
 impl<S: BlobStore> TreeReader<S> {
-    pub async fn open(store: S, tree_id: TreeId, cache: LocalCache) -> Result<Self> {
-        Self::open_with_config(store, tree_id, cache, ReadConfig::default()).await
+    pub async fn open(store: S, key: impl Into<String>, cache: LocalCache) -> Result<Self> {
+        Self::open_with_config(store, key, cache, ReadConfig::default()).await
     }
 
     pub async fn open_with_config(
         store: S,
-        tree_id: TreeId,
+        key: impl Into<String>,
         cache: LocalCache,
         read_config: ReadConfig,
     ) -> Result<Self> {
-        let tree = load_tree(&store, tree_id).await?;
-        let layout = load_layout(&store, tree.layout_id).await?;
+        let key = key.into();
+        let tree = load_tree(&store, &key).await?;
+        let layout = load_layout(&store, &key).await?;
+        let tree_id = tree.tree_id;
         ensure!(
             layout.tree_id == tree_id,
             "layout {} belongs to tree {}, not {}",
@@ -78,12 +80,12 @@ impl<S: BlobStore> TreeReader<S> {
             layout.tree_id,
             tree_id
         );
-        Self::from_manifest_with_config(store, tree_id, tree, layout, cache, None, read_config)
+        Self::from_manifest_with_config(store, key, tree, layout, cache, None, read_config)
     }
 
     pub fn from_manifest(
         store: S,
-        tree_id: TreeId,
+        _key: impl Into<String>,
         tree: TreeManifest,
         layout: LayoutManifest,
         cache: LocalCache,
@@ -91,7 +93,7 @@ impl<S: BlobStore> TreeReader<S> {
     ) -> Result<Self> {
         Self::from_manifest_with_config(
             store,
-            tree_id,
+            _key,
             tree,
             layout,
             cache,
@@ -102,13 +104,14 @@ impl<S: BlobStore> TreeReader<S> {
 
     pub fn from_manifest_with_config(
         store: S,
-        tree_id: TreeId,
+        _key: impl Into<String>,
         tree: TreeManifest,
         layout: LayoutManifest,
         cache: LocalCache,
         recorder: Option<ProfileRecorder>,
         read_config: ReadConfig,
     ) -> Result<Self> {
+        let tree_id = tree.tree_id;
         let read_config = read_config.validate()?;
         let files = tree
             .files

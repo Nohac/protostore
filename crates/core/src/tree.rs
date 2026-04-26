@@ -29,7 +29,13 @@ const STREAM_UPLOAD_PART_SIZE: usize = 64 * 1024 * 1024;
 pub struct PackConfig {
     pub chunk_size: usize,
     pub pack_workers: usize,
-    pub pack_key_prefix: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedTree {
+    pub key: String,
+    pub tree_id: TreeId,
 }
 
 impl Default for PackConfig {
@@ -37,7 +43,7 @@ impl Default for PackConfig {
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
             pack_workers: default_pack_workers(),
-            pack_key_prefix: generated_pack_key_prefix(),
+            key: generated_pack_key(),
         }
     }
 }
@@ -54,18 +60,18 @@ impl PackConfig {
             "pack workers must be greater than zero"
         );
         ensure!(
-            valid_pack_key_prefix(&self.pack_key_prefix),
+            valid_object_key(&self.key),
             "pack key must be relative and must not contain empty path segments or '..'"
         );
         Ok(self)
     }
 }
 
-fn generated_pack_key_prefix() -> String {
+fn generated_pack_key() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
-fn valid_pack_key_prefix(value: &str) -> bool {
+fn valid_object_key(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('/')
         && value
@@ -83,6 +89,7 @@ fn default_pack_workers() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TreeManifest {
     pub version: u32,
+    pub tree_id: TreeId,
     pub files: Vec<FileNode>,
     pub layout_id: LayoutId,
 }
@@ -137,50 +144,60 @@ pub fn layout_id(layout: &LayoutManifest) -> Result<LayoutId> {
     Ok(LayoutId::new(Hash32::digest(&json)))
 }
 
-pub fn tree_key(tree_id: TreeId) -> String {
-    format!("trees/{tree_id}.tree")
+pub fn tree_key(key: &str) -> String {
+    format!("trees/{key}.tree")
 }
 
-pub fn layout_key(layout_id: LayoutId) -> String {
-    format!("layouts/{layout_id}.layout")
+pub fn layout_key(key: &str) -> String {
+    format!("layouts/{key}.layout")
 }
 
-pub async fn load_tree<S: BlobStore>(store: &S, tree_id: TreeId) -> Result<TreeManifest> {
-    store.get_json(&tree_key(tree_id)).await
+pub async fn load_tree<S: BlobStore>(store: &S, key: &str) -> Result<TreeManifest> {
+    ensure!(valid_object_key(key), "invalid tree key {key}");
+    store.get_json(&tree_key(key)).await
 }
 
-pub async fn load_layout<S: BlobStore>(store: &S, layout_id: LayoutId) -> Result<LayoutManifest> {
-    store.get_json(&layout_key(layout_id)).await
+pub async fn load_layout<S: BlobStore>(store: &S, key: &str) -> Result<LayoutManifest> {
+    ensure!(valid_object_key(key), "invalid layout key {key}");
+    store.get_json(&layout_key(key)).await
 }
 
-pub async fn write_layout<S: BlobStore>(store: &S, layout: &LayoutManifest) -> Result<LayoutId> {
+pub async fn write_layout<S: BlobStore>(
+    store: &S,
+    key: &str,
+    layout: &LayoutManifest,
+) -> Result<LayoutId> {
+    ensure!(valid_object_key(key), "invalid layout key {key}");
     let id = layout_id(layout)?;
-    store.put_json(&layout_key(id), layout).await?;
+    store.put_json(&layout_key(key), layout).await?;
     Ok(id)
 }
 
 pub async fn write_tree<S: BlobStore>(
     store: &S,
+    key: &str,
     logical: &LogicalTreeManifest,
     locations: Vec<ChunkLocationHint>,
 ) -> Result<TreeId> {
+    ensure!(valid_object_key(key), "invalid tree key {key}");
     let id = tree_id(logical)?;
     let layout = LayoutManifest {
         version: 1,
         tree_id: id,
         locations,
     };
-    let layout_id = write_layout(store, &layout).await?;
+    let layout_id = write_layout(store, key, &layout).await?;
     let tree = TreeManifest {
         version: logical.version,
+        tree_id: id,
         files: logical.files.clone(),
         layout_id,
     };
-    store.put_json(&tree_key(id), &tree).await?;
+    store.put_json(&tree_key(key), &tree).await?;
     Ok(id)
 }
 
-pub async fn pack_directory<S: BlobStore>(store: &S, directory: &Path) -> Result<TreeId> {
+pub async fn pack_directory<S: BlobStore>(store: &S, directory: &Path) -> Result<PackedTree> {
     pack_directory_with_config(store, directory, PackConfig::default()).await
 }
 
@@ -188,8 +205,9 @@ pub async fn pack_directory_with_config<S: BlobStore>(
     store: &S,
     directory: &Path,
     config: PackConfig,
-) -> Result<TreeId> {
+) -> Result<PackedTree> {
     let config = config.validate()?;
+    let key = config.key.clone();
     let directory = directory
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", directory.display()))?;
@@ -273,7 +291,8 @@ pub async fn pack_directory_with_config<S: BlobStore>(
     files.sort_by(|a, b| a.path.cmp(&b.path));
     locations.sort_by_key(|hint| (hint.pack_key.clone(), hint.compressed_offset, hint.chunk_id));
     let tree = LogicalTreeManifest { version: 1, files };
-    write_tree(store, &tree, locations).await
+    let tree_id = write_tree(store, &key, &tree, locations).await?;
+    Ok(PackedTree { key, tree_id })
 }
 
 async fn append_ready_chunk<S: BlobStore>(
@@ -717,7 +736,7 @@ async fn append_compressed_chunk_to_pack<S: BlobStore>(
 }
 
 fn pack_key(config: &PackConfig) -> String {
-    format!("packs/{}.pack", config.pack_key_prefix)
+    format!("packs/{}.pack", config.key)
 }
 
 pub fn inspect_tree(tree_id: TreeId, tree: &TreeManifest, layout: &LayoutManifest) -> String {
@@ -732,41 +751,43 @@ pub fn inspect_tree(tree_id: TreeId, tree: &TreeManifest, layout: &LayoutManifes
 
 pub async fn materialize_tree<S: BlobStore>(
     store: S,
-    tree_id: TreeId,
+    key: &str,
     output_dir: &Path,
     cache: LocalCache,
 ) -> Result<()> {
-    materialize_tree_with_config(store, tree_id, output_dir, cache, ReadConfig::default()).await
+    materialize_tree_with_config(store, key, output_dir, cache, ReadConfig::default()).await
 }
 
 pub async fn materialize_tree_with_config<S: BlobStore>(
     store: S,
-    tree_id: TreeId,
+    key: &str,
     output_dir: &Path,
     cache: LocalCache,
     read_config: ReadConfig,
 ) -> Result<()> {
-    let reader = TreeReader::open_with_config(store, tree_id, cache, read_config).await?;
+    let reader = TreeReader::open_with_config(store, key, cache, read_config).await?;
     reader.materialize(output_dir).await
 }
 
 pub async fn repack_tree<S: BlobStore>(
     store: &S,
-    tree_id: TreeId,
+    key: &str,
     profile_id: ProfileId,
-) -> Result<TreeId> {
-    repack_tree_with_config(store, tree_id, profile_id, PackConfig::default()).await
+) -> Result<PackedTree> {
+    repack_tree_with_config(store, key, profile_id, PackConfig::default()).await
 }
 
 pub async fn repack_tree_with_config<S: BlobStore>(
     store: &S,
-    tree_id: TreeId,
+    key: &str,
     profile_id: ProfileId,
     config: PackConfig,
-) -> Result<TreeId> {
+) -> Result<PackedTree> {
     let config = config.validate()?;
-    let tree = load_tree(store, tree_id).await?;
-    let layout = load_layout(store, tree.layout_id).await?;
+    let output_key = config.key.clone();
+    let tree = load_tree(store, key).await?;
+    let layout = load_layout(store, key).await?;
+    let tree_id = tree.tree_id;
     ensure!(
         layout.tree_id == tree_id,
         "layout {} belongs to tree {}, not {}",
@@ -841,14 +862,18 @@ pub async fn repack_tree_with_config<S: BlobStore>(
         tree_id,
         locations: new_locations,
     };
-    let layout_id = write_layout(store, &new_layout).await?;
+    let layout_id = write_layout(store, &output_key, &new_layout).await?;
     let new_tree = TreeManifest {
         version: tree.version,
+        tree_id,
         files: tree.files,
         layout_id,
     };
-    store.put_json(&tree_key(tree_id), &new_tree).await?;
-    Ok(tree_id)
+    store.put_json(&tree_key(&output_key), &new_tree).await?;
+    Ok(PackedTree {
+        key: output_key,
+        tree_id,
+    })
 }
 
 pub fn file_map(tree: &TreeManifest) -> BTreeMap<String, FileNode> {

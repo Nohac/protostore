@@ -67,8 +67,8 @@ async fn range_read_single_chunk() {
     let cache_dir = TempDir::new().unwrap();
     write(&input.path().join("one.txt"), b"abcdef");
     let store = local_store(&store_dir);
-    let tree_id = pack_directory(&store, input.path()).await.unwrap();
-    let reader = TreeReader::open(store, tree_id, LocalCache::new(cache_dir.path()))
+    let packed = pack_directory(&store, input.path()).await.unwrap();
+    let reader = TreeReader::open(store, packed.key, LocalCache::new(cache_dir.path()))
         .await
         .unwrap();
     assert_eq!(reader.read_at("one.txt", 2, 3).await.unwrap(), "cde");
@@ -83,18 +83,18 @@ async fn range_read_spanning_multiple_chunks() {
     bytes.extend_from_slice(b"boundary");
     write(&input.path().join("large.bin"), &bytes);
     let store = local_store(&store_dir);
-    let tree_id = pack_directory_with_config(
+    let packed = pack_directory_with_config(
         &store,
         input.path(),
         PackConfig {
             chunk_size: 4 * 1024 * 1024,
             pack_workers: 2,
-            pack_key_prefix: "test-large".to_string(),
+            key: "test-large".to_string(),
         },
     )
     .await
     .unwrap();
-    let reader = TreeReader::open(store, tree_id, LocalCache::new(cache_dir.path()))
+    let reader = TreeReader::open(store, packed.key, LocalCache::new(cache_dir.path()))
         .await
         .unwrap();
     let got = reader
@@ -113,8 +113,8 @@ async fn pack_directory_and_materialize_roundtrip() {
     write(&input.path().join("nested/a.txt"), b"alpha");
     write(&input.path().join("b.txt"), b"beta");
     let store = local_store(&store_dir);
-    let tree_id = pack_directory(&store, input.path()).await.unwrap();
-    let reader = TreeReader::open(store, tree_id, LocalCache::new(cache_dir.path()))
+    let packed = pack_directory(&store, input.path()).await.unwrap();
+    let reader = TreeReader::open(store, packed.key, LocalCache::new(cache_dir.path()))
         .await
         .unwrap();
     reader.materialize(output.path()).await.unwrap();
@@ -133,19 +133,19 @@ async fn pack_directory_bundles_small_files_into_shared_chunks() {
     write(&input.path().join("a.txt"), b"alpha");
     write(&input.path().join("b.txt"), b"beta");
     let store = local_store(&store_dir);
-    let tree_id = pack_directory_with_config(
+    let packed = pack_directory_with_config(
         &store,
         input.path(),
         PackConfig {
             chunk_size: 1024,
             pack_workers: 2,
-            pack_key_prefix: "test-bundle".to_string(),
+            key: "test-bundle".to_string(),
         },
     )
     .await
     .unwrap();
-    let tree = load_tree(&store, tree_id).await.unwrap();
-    let layout = load_layout(&store, tree.layout_id).await.unwrap();
+    let tree = load_tree(&store, &packed.key).await.unwrap();
+    let layout = load_layout(&store, &packed.key).await.unwrap();
     assert_eq!(layout.locations.len(), 1);
     assert_eq!(tree.files.len(), 2);
     assert_eq!(
@@ -155,7 +155,7 @@ async fn pack_directory_bundles_small_files_into_shared_chunks() {
     assert_eq!(tree.files[0].chunks[0].chunk_offset, 0);
     assert_eq!(tree.files[1].chunks[0].chunk_offset, 5);
 
-    let reader = TreeReader::open(store, tree_id, LocalCache::new(cache_dir.path()))
+    let reader = TreeReader::open(store, packed.key, LocalCache::new(cache_dir.path()))
         .await
         .unwrap();
     assert_eq!(reader.read_at("a.txt", 1, 3).await.unwrap(), "lph");
@@ -169,8 +169,8 @@ async fn tree_reader_full_and_partial_file_reads() {
     let cache_dir = TempDir::new().unwrap();
     write(&input.path().join("file.txt"), b"0123456789");
     let store = local_store(&store_dir);
-    let id = pack_directory(&store, input.path()).await.unwrap();
-    let reader = TreeReader::open(store, id, LocalCache::new(cache_dir.path()))
+    let packed = pack_directory(&store, input.path()).await.unwrap();
+    let reader = TreeReader::open(store, packed.key, LocalCache::new(cache_dir.path()))
         .await
         .unwrap();
     assert_eq!(
@@ -200,10 +200,10 @@ async fn repack_produces_readable_output() {
     write(&input.path().join("a.txt"), b"alpha");
     write(&input.path().join("b.txt"), b"beta");
     let store = local_store(&store_dir);
-    let original_tree = pack_directory(&store, input.path()).await.unwrap();
+    let original = pack_directory(&store, input.path()).await.unwrap();
     let reader = TreeReader::open(
         store.clone(),
-        original_tree,
+        original.key.clone(),
         LocalCache::new(cache_dir.path()),
     )
     .await
@@ -214,14 +214,15 @@ async fn repack_produces_readable_output() {
     let profile_id = write_profile(&store, &reader.recorder().unwrap().profile())
         .await
         .unwrap();
-    let original_layout = load_tree(&store, original_tree).await.unwrap().layout_id;
-    let new_tree = repack_tree(&store, original_tree, profile_id)
+    let original_layout = load_tree(&store, &original.key).await.unwrap().layout_id;
+    let repacked = repack_tree(&store, &original.key, profile_id)
         .await
         .unwrap();
-    assert_eq!(new_tree, original_tree);
-    let updated_layout = load_tree(&store, original_tree).await.unwrap().layout_id;
+    assert_eq!(repacked.tree_id, original.tree_id);
+    assert_ne!(repacked.key, original.key);
+    let updated_layout = load_tree(&store, &repacked.key).await.unwrap().layout_id;
     assert_ne!(updated_layout, original_layout);
-    let new_reader = TreeReader::open(store, new_tree, LocalCache::new(cache_dir.path()))
+    let new_reader = TreeReader::open(store, repacked.key, LocalCache::new(cache_dir.path()))
         .await
         .unwrap();
     assert_eq!(new_reader.read_at("a.txt", 0, 5).await.unwrap(), "alpha");
@@ -234,16 +235,28 @@ async fn tree_object_is_written_last_and_loadable() {
     let store_dir = TempDir::new().unwrap();
     write(&input.path().join("x"), b"x");
     let store = local_store(&store_dir);
-    let id = pack_directory(&store, input.path()).await.unwrap();
-    let tree = load_tree(&store, id).await.unwrap();
-    let layout = load_layout(&store, tree.layout_id).await.unwrap();
+    let packed = pack_directory(&store, input.path()).await.unwrap();
+    let tree = load_tree(&store, &packed.key).await.unwrap();
+    let layout = load_layout(&store, &packed.key).await.unwrap();
     assert_eq!(tree.files.len(), 1);
-    assert_eq!(layout.tree_id, id);
+    assert_eq!(tree.tree_id, packed.tree_id);
+    assert_eq!(layout.tree_id, packed.tree_id);
     assert_eq!(layout.locations.len(), 1);
-    assert!(store.exists(&format!("trees/{id}.tree")).await.unwrap());
     assert!(
         store
-            .exists(&format!("layouts/{}.layout", tree.layout_id))
+            .exists(&format!("trees/{}.tree", packed.key))
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .exists(&format!("layouts/{}.layout", packed.key))
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .exists(&format!("packs/{}.pack", packed.key))
             .await
             .unwrap()
     );

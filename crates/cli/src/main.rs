@@ -1,10 +1,10 @@
 mod cli;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command};
 use protostore_core::{
-    LocalCache, ObjectBlobStore, PackConfig, ProfileId, ReadConfig, TreeId, inspect_tree,
+    LocalCache, ObjectBlobStore, PackConfig, ProfileId, ReadConfig, inspect_tree,
     materialize_tree_with_config, pack_directory_with_config, repack_tree,
 };
 use std::{path::Path, str::FromStr, thread, time::Duration};
@@ -27,31 +27,28 @@ fn main() -> Result<()> {
             let store = ObjectBlobStore::from_uri(&store)?;
             let pack_config = pack_config(chunk_size, pack_workers, key)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
-            let tree_id =
+            let packed =
                 runtime.block_on(pack_directory_with_config(&store, &directory, pack_config))?;
-            println!("{tree_id}");
+            println!("{}", packed.key);
         }
-        Command::Inspect { tree_id, store } => {
-            let tree_id = parse_tree_id(&tree_id)?;
+        Command::Inspect { key, store } => {
             let store = ObjectBlobStore::from_uri(&store)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
-            let tree = runtime.block_on(protostore_core::tree::load_tree(&store, tree_id))?;
-            let layout =
-                runtime.block_on(protostore_core::tree::load_layout(&store, tree.layout_id))?;
-            println!("{}", inspect_tree(tree_id, &tree, &layout));
+            let tree = runtime.block_on(protostore_core::tree::load_tree(&store, &key))?;
+            let layout = runtime.block_on(protostore_core::tree::load_layout(&store, &key))?;
+            println!("{}", inspect_tree(tree.tree_id, &tree, &layout));
         }
         Command::Mount {
-            tree_id,
+            key,
             mountpoint,
             store,
             min_remote_read,
             target_coalesce,
         } => {
-            let tree_id = parse_tree_id(&tree_id)?;
             let store = ObjectBlobStore::from_uri(&store)?;
             let read_config = read_config(min_remote_read, target_coalesce)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
-            let session = protostore_fuse::ProtoStoreFuseBuilder::new(store, tree_id)
+            let session = protostore_fuse::ProtoStoreFuseBuilder::new(store, key)
                 .runtime_handle(runtime.handle().clone())
                 .cache(LocalCache::disposable_default())
                 .read_config(read_config)
@@ -79,47 +76,36 @@ fn main() -> Result<()> {
             }
         }
         Command::Materialize {
-            tree_id,
+            key,
             output_dir,
             store,
             min_remote_read,
             target_coalesce,
         } => {
-            let tree_id = parse_tree_id(&tree_id)?;
             let store = ObjectBlobStore::from_uri(&store)?;
             let read_config = read_config(min_remote_read, target_coalesce)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
             runtime.block_on(materialize_tree_with_config(
                 store,
-                tree_id,
+                &key,
                 &output_dir,
                 LocalCache::disposable_default(),
                 read_config,
             ))?;
         }
         Command::Repack {
-            tree_id,
+            key,
             profile,
             store,
         } => {
-            let tree_id = parse_tree_id(&tree_id)?;
             let profile_id = ProfileId::from_str(&profile).context("parsing profile id")?;
             let store = ObjectBlobStore::from_uri(&store)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
-            let new_tree_id = runtime.block_on(repack_tree(&store, tree_id, profile_id))?;
-            println!("{new_tree_id}");
+            let packed = runtime.block_on(repack_tree(&store, &key, profile_id))?;
+            println!("{}", packed.key);
         }
     }
     Ok(())
-}
-
-fn parse_tree_id(value: &str) -> Result<TreeId> {
-    if value.contains('-') {
-        bail!(
-            "parsing tree id: {value} looks like a pack key UUID, not a TreeId. Use the 64-character hex id printed by `protostore pack`, or inspect trees/<tree-id>.tree in the store."
-        );
-    }
-    TreeId::from_str(value).context("parsing tree id")
 }
 
 fn is_mounted(mountpoint: &Path) -> Result<bool> {
@@ -155,7 +141,7 @@ fn pack_config(
     PackConfig {
         chunk_size,
         pack_workers: pack_workers.unwrap_or(defaults.pack_workers),
-        pack_key_prefix: key.unwrap_or(defaults.pack_key_prefix),
+        key: key.unwrap_or(defaults.key),
     }
     .validate()
 }

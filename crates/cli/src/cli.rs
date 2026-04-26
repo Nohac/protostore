@@ -29,12 +29,12 @@ pub enum Command {
         key: Option<String>,
     },
     Inspect {
-        tree_id: String,
+        key: String,
         #[arg(long)]
         store: String,
     },
     Mount {
-        tree_id: String,
+        key: String,
         mountpoint: PathBuf,
         #[arg(long)]
         store: String,
@@ -44,7 +44,7 @@ pub enum Command {
         target_coalesce: Option<usize>,
     },
     Materialize {
-        tree_id: String,
+        key: String,
         output_dir: PathBuf,
         #[arg(long)]
         store: String,
@@ -54,7 +54,7 @@ pub enum Command {
         target_coalesce: Option<usize>,
     },
     Repack {
-        tree_id: String,
+        key: String,
         #[arg(long)]
         profile: String,
         #[arg(long)]
