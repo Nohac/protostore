@@ -23,12 +23,11 @@ use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 pub const DEFAULT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
-pub const PACK_TARGET_SIZE: usize = 128 * 1024 * 1024;
+const STREAM_UPLOAD_PART_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackConfig {
     pub chunk_size: usize,
-    pub pack_target_size: usize,
     pub pack_workers: usize,
     pub pack_key_prefix: String,
 }
@@ -37,7 +36,6 @@ impl Default for PackConfig {
     fn default() -> Self {
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
-            pack_target_size: PACK_TARGET_SIZE,
             pack_workers: default_pack_workers(),
             pack_key_prefix: generated_pack_key_prefix(),
         }
@@ -50,10 +48,6 @@ impl PackConfig {
         ensure!(
             self.chunk_size <= u32::MAX as usize,
             "chunk size must fit in u32"
-        );
-        ensure!(
-            self.pack_target_size >= self.chunk_size,
-            "pack target size must be at least chunk size"
         );
         ensure!(
             self.pack_workers > 0,
@@ -262,19 +256,9 @@ pub async fn pack_directory_with_config<S: BlobStore>(
 
     let mut locations = Vec::new();
     let mut active_pack = None;
-    let mut next_pack_index = 0usize;
 
     while let Ok(ready) = ready_rx.recv().await {
-        append_ready_chunk(
-            store,
-            ready?,
-            &config,
-            &mut files,
-            &mut active_pack,
-            &mut next_pack_index,
-            &mut locations,
-        )
-        .await?;
+        append_ready_chunk(store, ready?, &config, &mut files, &mut active_pack).await?;
     }
     producer.await.context("joining pack job producer")?;
     batcher.await.context("joining pack batcher")??;
@@ -298,8 +282,6 @@ async fn append_ready_chunk<S: BlobStore>(
     config: &PackConfig,
     files: &mut [FileNode],
     active_pack: &mut Option<ActivePack>,
-    next_pack_index: &mut usize,
-    locations: &mut Vec<ChunkLocationHint>,
 ) -> Result<()> {
     let chunk_id = ready.chunk_id;
     for chunk_ref in ready.refs {
@@ -317,8 +299,6 @@ async fn append_ready_chunk<S: BlobStore>(
         store,
         config,
         active_pack,
-        next_pack_index,
-        locations,
         chunk_id,
         ready.compressed,
         ready.uncompressed_len,
@@ -685,23 +665,13 @@ struct ReadyChunkRef {
 
 struct ActivePack {
     key: String,
-    compressed_len: usize,
     writer: StreamingPackWriter,
 }
 
-async fn start_active_pack<S: BlobStore>(
-    store: &S,
-    config: &PackConfig,
-    pack_index: usize,
-) -> Result<ActivePack> {
-    let key = pack_key_for_index(config, pack_index);
-    let writer =
-        StreamingPackWriter::start(store, &key, PACK_TARGET_SIZE.min(64 * 1024 * 1024)).await?;
-    Ok(ActivePack {
-        key,
-        compressed_len: 0,
-        writer,
-    })
+async fn start_active_pack<S: BlobStore>(store: &S, config: &PackConfig) -> Result<ActivePack> {
+    let key = pack_key(config);
+    let writer = StreamingPackWriter::start(store, &key, STREAM_UPLOAD_PART_SIZE).await?;
+    Ok(ActivePack { key, writer })
 }
 
 async fn finish_active_pack(
@@ -731,31 +701,23 @@ async fn append_compressed_chunk_to_pack<S: BlobStore>(
     store: &S,
     config: &PackConfig,
     active_pack: &mut Option<ActivePack>,
-    next_pack_index: &mut usize,
-    locations: &mut Vec<ChunkLocationHint>,
     chunk_id: ChunkId,
     compressed: Vec<u8>,
     uncompressed_len: u32,
 ) -> Result<()> {
     if active_pack.is_none() {
-        *active_pack = Some(start_active_pack(store, config, *next_pack_index).await?);
-        *next_pack_index += 1;
+        *active_pack = Some(start_active_pack(store, config).await?);
     }
     let pack = active_pack
         .as_mut()
         .context("active pack missing after start")?;
-    pack.compressed_len += compressed.len();
     pack.writer
         .append_chunk(chunk_id, compressed, uncompressed_len)
-        .await?;
-    if pack.compressed_len >= config.pack_target_size {
-        finish_active_pack(active_pack, locations).await?;
-    }
-    Ok(())
+        .await
 }
 
-fn pack_key_for_index(config: &PackConfig, pack_index: usize) -> String {
-    format!("packs/{}/{pack_index:06}.pack", config.pack_key_prefix)
+fn pack_key(config: &PackConfig) -> String {
+    format!("packs/{}.pack", config.pack_key_prefix)
 }
 
 pub fn inspect_tree(tree_id: TreeId, tree: &TreeManifest, layout: &LayoutManifest) -> String {
@@ -844,7 +806,6 @@ pub async fn repack_tree_with_config<S: BlobStore>(
 
     let mut new_locations = Vec::new();
     let mut active_pack = None;
-    let mut next_pack_index = 0usize;
     for (chunk_id, _, _) in chunk_order {
         let hint = location_by_chunk
             .get(&chunk_id)
@@ -866,8 +827,6 @@ pub async fn repack_tree_with_config<S: BlobStore>(
             store,
             &config,
             &mut active_pack,
-            &mut next_pack_index,
-            &mut new_locations,
             chunk_id,
             compressed,
             hint.uncompressed_len,

@@ -21,12 +21,11 @@ fn main() -> Result<()> {
             directory,
             store,
             chunk_size,
-            pack_target_size,
             pack_workers,
             key,
         } => {
             let store = ObjectBlobStore::from_uri(&store)?;
-            let pack_config = pack_config(chunk_size, pack_target_size, pack_workers, key)?;
+            let pack_config = pack_config(chunk_size, pack_workers, key)?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
             let tree_id =
                 runtime.block_on(pack_directory_with_config(&store, &directory, pack_config))?;
@@ -148,7 +147,6 @@ fn unescape_mountinfo_path(path: &str) -> String {
 
 fn pack_config(
     chunk_size: Option<usize>,
-    pack_target_size: Option<usize>,
     pack_workers: Option<usize>,
     key: Option<String>,
 ) -> Result<PackConfig> {
@@ -156,7 +154,6 @@ fn pack_config(
     let chunk_size = chunk_size.unwrap_or(defaults.chunk_size);
     PackConfig {
         chunk_size,
-        pack_target_size: pack_target_size.unwrap_or(defaults.pack_target_size.max(chunk_size)),
         pack_workers: pack_workers.unwrap_or(defaults.pack_workers),
         pack_key_prefix: key.unwrap_or(defaults.pack_key_prefix),
     }

@@ -17,8 +17,6 @@ pub enum Command {
         store: String,
         #[arg(long, value_parser = crate::parse_size)]
         chunk_size: Option<usize>,
-        #[arg(long, value_parser = crate::parse_size)]
-        pack_target_size: Option<usize>,
         #[arg(
             long,
             help = "Number of parallel pack workers. Defaults to available CPU threads."
