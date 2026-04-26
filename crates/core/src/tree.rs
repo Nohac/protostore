@@ -11,6 +11,7 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_channel::{Receiver, Sender};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -26,6 +27,8 @@ use walkdir::WalkDir;
 pub const DEFAULT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 pub const DEFAULT_COMPRESSION_LEVEL: i32 = 0;
 const STREAM_UPLOAD_PART_SIZE: usize = 64 * 1024 * 1024;
+const TREE_MAGIC: &[u8; 8] = b"PSTTREE\0";
+const TREE_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackConfig {
@@ -146,7 +149,8 @@ pub fn tree_key(key: &str) -> String {
 
 pub async fn load_tree<S: BlobStore>(store: &S, key: &str) -> Result<TreeManifest> {
     ensure!(valid_object_key(key), "invalid tree key {key}");
-    store.get_json(&tree_key(key)).await
+    let bytes = store.get_bytes(&tree_key(key)).await?;
+    decode_tree_manifest(&bytes)
 }
 
 pub async fn write_tree<S: BlobStore>(
@@ -163,8 +167,41 @@ pub async fn write_tree<S: BlobStore>(
         files: logical.files.clone(),
         locations,
     };
-    store.put_json(&tree_key(key), &tree).await?;
+    let bytes = encode_tree_manifest(&tree)?;
+    store.put_bytes(&tree_key(key), Bytes::from(bytes)).await?;
     Ok(id)
+}
+
+pub fn encode_tree_manifest(tree: &TreeManifest) -> Result<Vec<u8>> {
+    let body = postcard::to_allocvec(tree).context("postcard encode tree manifest")?;
+    let compressed =
+        zstd::stream::encode_all(&body[..], 0).context("zstd compress tree manifest")?;
+    let mut out = Vec::with_capacity(TREE_MAGIC.len() + 4 + compressed.len());
+    out.extend_from_slice(TREE_MAGIC);
+    out.extend_from_slice(&TREE_FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&compressed);
+    Ok(out)
+}
+
+pub fn decode_tree_manifest(bytes: &[u8]) -> Result<TreeManifest> {
+    ensure!(
+        bytes.len() >= TREE_MAGIC.len() + 4,
+        "tree manifest object too small"
+    );
+    ensure!(
+        &bytes[..TREE_MAGIC.len()] == TREE_MAGIC,
+        "invalid tree manifest magic"
+    );
+    let version_start = TREE_MAGIC.len();
+    let version_end = version_start + 4;
+    let version = u32::from_le_bytes(bytes[version_start..version_end].try_into().unwrap());
+    ensure!(
+        version == TREE_FORMAT_VERSION,
+        "unsupported tree manifest format version {version}"
+    );
+    let decompressed =
+        zstd::stream::decode_all(&bytes[version_end..]).context("zstd decompress tree manifest")?;
+    postcard::from_bytes(&decompressed).context("postcard decode tree manifest")
 }
 
 pub async fn pack_directory<S: BlobStore>(store: &S, directory: &Path) -> Result<PackedTree> {
@@ -846,7 +883,10 @@ pub async fn repack_tree_with_config<S: BlobStore>(
         files: tree.files,
         locations: new_locations,
     };
-    store.put_json(&tree_key(&output_key), &new_tree).await?;
+    let bytes = encode_tree_manifest(&new_tree)?;
+    store
+        .put_bytes(&tree_key(&output_key), Bytes::from(bytes))
+        .await?;
     Ok(PackedTree {
         key: output_key,
         tree_id,

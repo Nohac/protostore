@@ -4,7 +4,9 @@ use protostore_core::{
     pack::{FOOTER_LEN, compress_chunk, decompress_chunk, encode_pack, parse_footer},
     pack_directory_with_config,
     profile::write_profile,
-    tree::{LogicalTreeManifest, load_tree, pack_directory, repack_tree, tree_id},
+    tree::{
+        LogicalTreeManifest, decode_tree_manifest, load_tree, pack_directory, repack_tree, tree_id,
+    },
 };
 use std::{fs, path::Path};
 use tempfile::TempDir;
@@ -247,6 +249,12 @@ async fn tree_object_is_written_last_and_loadable() {
             .await
             .unwrap()
     );
+    let tree_object = store
+        .get_bytes(&format!("trees/{}.tree", packed.key))
+        .await
+        .unwrap();
+    assert!(tree_object.starts_with(b"PSTTREE\0"));
+    assert_eq!(decode_tree_manifest(&tree_object).unwrap(), tree);
     assert!(
         !store
             .exists(&format!("layouts/{}.layout", packed.key))
