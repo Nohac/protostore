@@ -4,7 +4,7 @@ use protostore_core::{
     pack::{FOOTER_LEN, compress_chunk, decompress_chunk, encode_pack, parse_footer},
     pack_directory_with_config,
     profile::write_profile,
-    tree::{LogicalTreeManifest, load_layout, load_tree, pack_directory, repack_tree, tree_id},
+    tree::{LogicalTreeManifest, load_tree, pack_directory, repack_tree, tree_id},
 };
 use std::{fs, path::Path};
 use tempfile::TempDir;
@@ -147,8 +147,7 @@ async fn pack_directory_bundles_small_files_into_shared_chunks() {
     .await
     .unwrap();
     let tree = load_tree(&store, &packed.key).await.unwrap();
-    let layout = load_layout(&store, &packed.key).await.unwrap();
-    assert_eq!(layout.locations.len(), 1);
+    assert_eq!(tree.locations.len(), 1);
     assert_eq!(tree.files.len(), 2);
     assert_eq!(
         tree.files[0].chunks[0].chunk_id,
@@ -216,14 +215,14 @@ async fn repack_produces_readable_output() {
     let profile_id = write_profile(&store, &reader.recorder().unwrap().profile())
         .await
         .unwrap();
-    let original_layout = load_tree(&store, &original.key).await.unwrap().layout_id;
+    let original_locations = load_tree(&store, &original.key).await.unwrap().locations;
     let repacked = repack_tree(&store, &original.key, profile_id)
         .await
         .unwrap();
     assert_eq!(repacked.tree_id, original.tree_id);
     assert_ne!(repacked.key, original.key);
-    let updated_layout = load_tree(&store, &repacked.key).await.unwrap().layout_id;
-    assert_ne!(updated_layout, original_layout);
+    let updated_locations = load_tree(&store, &repacked.key).await.unwrap().locations;
+    assert_ne!(updated_locations, original_locations);
     let new_reader = TreeReader::open(store, repacked.key, LocalCache::new(cache_dir.path()))
         .await
         .unwrap();
@@ -239,11 +238,9 @@ async fn tree_object_is_written_last_and_loadable() {
     let store = local_store(&store_dir);
     let packed = pack_directory(&store, input.path()).await.unwrap();
     let tree = load_tree(&store, &packed.key).await.unwrap();
-    let layout = load_layout(&store, &packed.key).await.unwrap();
     assert_eq!(tree.files.len(), 1);
     assert_eq!(tree.tree_id, packed.tree_id);
-    assert_eq!(layout.tree_id, packed.tree_id);
-    assert_eq!(layout.locations.len(), 1);
+    assert_eq!(tree.locations.len(), 1);
     assert!(
         store
             .exists(&format!("trees/{}.tree", packed.key))
@@ -251,7 +248,7 @@ async fn tree_object_is_written_last_and_loadable() {
             .unwrap()
     );
     assert!(
-        store
+        !store
             .exists(&format!("layouts/{}.layout", packed.key))
             .await
             .unwrap()

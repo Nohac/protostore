@@ -4,10 +4,7 @@ use crate::{
     pack::decompress_chunk,
     profile::ProfileRecorder,
     store::BlobStore,
-    tree::{
-        FileNode, LayoutManifest, TreeManifest, load_layout, load_tree, location_map,
-        safe_output_path, write_file_mode,
-    },
+    tree::{FileNode, TreeManifest, load_tree, location_map, safe_output_path, write_file_mode},
 };
 use anyhow::{Context, Result, bail, ensure};
 use bytes::{Bytes, BytesMut};
@@ -20,7 +17,6 @@ pub struct TreeReader<S> {
     store: S,
     tree_id: TreeId,
     tree: TreeManifest,
-    layout: LayoutManifest,
     files: HashMap<String, FileNode>,
     locations: HashMap<crate::ChunkId, crate::ChunkLocationHint>,
     pack_data_end: HashMap<String, u64>,
@@ -71,42 +67,23 @@ impl<S: BlobStore> TreeReader<S> {
     ) -> Result<Self> {
         let key = key.into();
         let tree = load_tree(&store, &key).await?;
-        let layout = load_layout(&store, &key).await?;
-        let tree_id = tree.tree_id;
-        ensure!(
-            layout.tree_id == tree_id,
-            "layout {} belongs to tree {}, not {}",
-            tree.layout_id,
-            layout.tree_id,
-            tree_id
-        );
-        Self::from_manifest_with_config(store, key, tree, layout, cache, None, read_config)
+        Self::from_manifest_with_config(store, key, tree, cache, None, read_config)
     }
 
     pub fn from_manifest(
         store: S,
         _key: impl Into<String>,
         tree: TreeManifest,
-        layout: LayoutManifest,
         cache: LocalCache,
         recorder: Option<ProfileRecorder>,
     ) -> Result<Self> {
-        Self::from_manifest_with_config(
-            store,
-            _key,
-            tree,
-            layout,
-            cache,
-            recorder,
-            ReadConfig::default(),
-        )
+        Self::from_manifest_with_config(store, _key, tree, cache, recorder, ReadConfig::default())
     }
 
     pub fn from_manifest_with_config(
         store: S,
         _key: impl Into<String>,
         tree: TreeManifest,
-        layout: LayoutManifest,
         cache: LocalCache,
         recorder: Option<ProfileRecorder>,
         read_config: ReadConfig,
@@ -118,16 +95,9 @@ impl<S: BlobStore> TreeReader<S> {
             .iter()
             .map(|file| (file.path.clone(), file.clone()))
             .collect();
-        ensure!(
-            layout.tree_id == tree_id,
-            "layout {} belongs to tree {}, not {}",
-            tree.layout_id,
-            layout.tree_id,
-            tree_id
-        );
-        let locations = location_map(&layout);
+        let locations = location_map(&tree);
         let mut pack_data_end = HashMap::<String, u64>::new();
-        for hint in &layout.locations {
+        for hint in &tree.locations {
             let end = hint.compressed_offset + u64::from(hint.compressed_len);
             pack_data_end
                 .entry(hint.pack_key.clone())
@@ -138,7 +108,6 @@ impl<S: BlobStore> TreeReader<S> {
             store,
             tree_id,
             tree,
-            layout,
             files,
             locations,
             pack_data_end,
@@ -150,10 +119,6 @@ impl<S: BlobStore> TreeReader<S> {
 
     pub fn tree(&self) -> &TreeManifest {
         &self.tree
-    }
-
-    pub fn layout(&self) -> &LayoutManifest {
-        &self.layout
     }
 
     pub fn recorder(&self) -> Option<ProfileRecorder> {

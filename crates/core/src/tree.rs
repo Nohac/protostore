@@ -1,6 +1,6 @@
 use crate::{
     cache::LocalCache,
-    hash::{ChunkId, Hash32, LayoutId, ProfileId, TreeId},
+    hash::{ChunkId, Hash32, ProfileId, TreeId},
     pack::{
         ChunkEntry, Compression, StreamingPackWriter, compress_chunk_with_level,
         read_chunk_from_pack_key,
@@ -99,20 +99,13 @@ pub struct TreeManifest {
     pub version: u32,
     pub tree_id: TreeId,
     pub files: Vec<FileNode>,
-    pub layout_id: LayoutId,
+    pub locations: Vec<ChunkLocationHint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LogicalTreeManifest {
     pub version: u32,
     pub files: Vec<FileNode>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LayoutManifest {
-    pub version: u32,
-    pub tree_id: TreeId,
-    pub locations: Vec<ChunkLocationHint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,38 +140,13 @@ pub fn tree_id(tree: &LogicalTreeManifest) -> Result<TreeId> {
     Ok(TreeId::new(Hash32::digest(&json)))
 }
 
-pub fn layout_id(layout: &LayoutManifest) -> Result<LayoutId> {
-    let json = serde_json::to_vec(layout).context("serializing layout manifest")?;
-    Ok(LayoutId::new(Hash32::digest(&json)))
-}
-
 pub fn tree_key(key: &str) -> String {
     format!("trees/{key}.tree")
-}
-
-pub fn layout_key(key: &str) -> String {
-    format!("layouts/{key}.layout")
 }
 
 pub async fn load_tree<S: BlobStore>(store: &S, key: &str) -> Result<TreeManifest> {
     ensure!(valid_object_key(key), "invalid tree key {key}");
     store.get_json(&tree_key(key)).await
-}
-
-pub async fn load_layout<S: BlobStore>(store: &S, key: &str) -> Result<LayoutManifest> {
-    ensure!(valid_object_key(key), "invalid layout key {key}");
-    store.get_json(&layout_key(key)).await
-}
-
-pub async fn write_layout<S: BlobStore>(
-    store: &S,
-    key: &str,
-    layout: &LayoutManifest,
-) -> Result<LayoutId> {
-    ensure!(valid_object_key(key), "invalid layout key {key}");
-    let id = layout_id(layout)?;
-    store.put_json(&layout_key(key), layout).await?;
-    Ok(id)
 }
 
 pub async fn write_tree<S: BlobStore>(
@@ -189,17 +157,11 @@ pub async fn write_tree<S: BlobStore>(
 ) -> Result<TreeId> {
     ensure!(valid_object_key(key), "invalid tree key {key}");
     let id = tree_id(logical)?;
-    let layout = LayoutManifest {
-        version: 1,
-        tree_id: id,
-        locations,
-    };
-    let layout_id = write_layout(store, key, &layout).await?;
     let tree = TreeManifest {
         version: logical.version,
         tree_id: id,
         files: logical.files.clone(),
-        layout_id,
+        locations,
     };
     store.put_json(&tree_key(key), &tree).await?;
     Ok(id)
@@ -769,13 +731,12 @@ fn pack_key(config: &PackConfig) -> String {
     format!("packs/{}.pack", config.key)
 }
 
-pub fn inspect_tree(tree_id: TreeId, tree: &TreeManifest, layout: &LayoutManifest) -> String {
+pub fn inspect_tree(tree_id: TreeId, tree: &TreeManifest) -> String {
     let file_count = tree.files.len();
-    let chunk_count = layout.locations.len();
+    let chunk_count = tree.locations.len();
     let total_size: u64 = tree.files.iter().map(|file| file.size).sum();
-    let layout_id = tree.layout_id;
     format!(
-        "tree {tree_id}\nlayout: {layout_id}\nfiles: {file_count}\nchunks: {chunk_count}\nlogical bytes: {total_size}"
+        "tree {tree_id}\nfiles: {file_count}\nchunks: {chunk_count}\nlogical bytes: {total_size}"
     )
 }
 
@@ -816,22 +777,14 @@ pub async fn repack_tree_with_config<S: BlobStore>(
     let config = config.validate()?;
     let output_key = config.key.clone();
     let tree = load_tree(store, key).await?;
-    let layout = load_layout(store, key).await?;
     let tree_id = tree.tree_id;
-    ensure!(
-        layout.tree_id == tree_id,
-        "layout {} belongs to tree {}, not {}",
-        tree.layout_id,
-        layout.tree_id,
-        tree_id
-    );
     let profile = load_profile(store, profile_id).await?;
     let read_times: HashMap<ChunkId, u128> = profile
         .events
         .into_iter()
         .map(|event| (event.chunk_id, event.first_read_unix_ns))
         .collect();
-    let location_by_chunk: HashMap<ChunkId, ChunkLocationHint> = layout
+    let location_by_chunk: HashMap<ChunkId, ChunkLocationHint> = tree
         .locations
         .iter()
         .map(|hint| (hint.chunk_id, hint.clone()))
@@ -887,17 +840,11 @@ pub async fn repack_tree_with_config<S: BlobStore>(
     finish_active_pack(&mut active_pack, &mut new_locations).await?;
     new_locations
         .sort_by_key(|hint| (hint.pack_key.clone(), hint.compressed_offset, hint.chunk_id));
-    let new_layout = LayoutManifest {
-        version: 1,
-        tree_id,
-        locations: new_locations,
-    };
-    let layout_id = write_layout(store, &output_key, &new_layout).await?;
     let new_tree = TreeManifest {
         version: tree.version,
         tree_id,
         files: tree.files,
-        layout_id,
+        locations: new_locations,
     };
     store.put_json(&tree_key(&output_key), &new_tree).await?;
     Ok(PackedTree {
@@ -913,9 +860,8 @@ pub fn file_map(tree: &TreeManifest) -> BTreeMap<String, FileNode> {
         .collect()
 }
 
-pub fn location_map(layout: &LayoutManifest) -> HashMap<ChunkId, ChunkLocationHint> {
-    layout
-        .locations
+pub fn location_map(tree: &TreeManifest) -> HashMap<ChunkId, ChunkLocationHint> {
+    tree.locations
         .iter()
         .map(|hint| (hint.chunk_id, hint.clone()))
         .collect()

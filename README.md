@@ -48,9 +48,8 @@ protostore materialize <key> <out> --store file:///tmp/store --min-remote-read 1
 All durable state lives under object-store keys:
 
 ```text
-packs/<pack-key>.pack
 trees/<key>.tree
-layouts/<key>.layout
+packs/<key>.pack
 profiles/<profile-id>.profile
 refs/<name>.ref
 ```
@@ -59,15 +58,15 @@ Local disk is disposable cache only, currently `.protostore-cache/chunks/<chunk-
 
 ## Pack Format
 
-Pack blobs use a fixed header, independently compressed zstd chunk frames, a JSON index, and a fixed footer. Tree manifests describe logical files and chunk IDs. Layout manifests map chunk IDs to physical pack object keys and offsets. Readers parse the footer, verify the index hash, resolve chunk offsets through the layout, then range-read only the compressed chunk frames needed for a file read.
+Pack blobs use a fixed header, independently compressed zstd chunk frames, a JSON index, and a fixed footer. Tree manifests describe logical files, chunk IDs, and the physical pack offsets for those chunks. Readers resolve chunk locations through the tree, then range-read only the compressed chunk frames needed for a file read.
 
-Pack, tree, and layout objects are written under the same key. `--key` controls the object names below `packs/`, `trees/`, and `layouts/`; if omitted, the CLI uses a generated UUIDv7 key and prints it. Each pack operation currently writes `packs/<key>.pack`, `trees/<key>.tree`, and `layouts/<key>.layout`. Manifests still store `tree_id`, `layout_id`, and `pack_hash` for integrity instead of requiring content-addressed object names.
+Pack and tree objects are written under the same key. `--key` controls the object names below `packs/` and `trees/`; if omitted, the CLI uses a generated UUIDv7 key and prints it. Each pack operation currently writes `packs/<key>.pack` and `trees/<key>.tree`. Manifests still store `tree_id` and `pack_hash` for integrity instead of requiring content-addressed object names.
 
-Packing uses bounded `tokio-uring` workers on Linux to read files and compute chunk hashes/compression concurrently. The CLI defaults `--pack-workers` to the number of available CPU threads and `--compression-level` to `0`, which uses zstd's default level. Tree identity is based on logical file content; physical pack layout is stored separately in a layout object.
+Packing uses bounded `tokio-uring` workers on Linux to read files and compute chunk hashes/compression concurrently. The CLI defaults `--pack-workers` to the number of available CPU threads and `--compression-level` to `0`, which uses zstd's default level. Tree identity is based on logical file content.
 
 ## Lazy Reads And FUSE
 
-`TreeReader` loads a tree and its referenced layout, maps logical file ranges to chunk references, resolves chunk locations, coalesces adjacent compressed chunk reads from the same pack, decompresses selected chunks, and stores decompressed chunks in the local disposable cache. The FUSE crate is intentionally thin and delegates file content reads to `TreeReader`.
+`TreeReader` loads a tree, maps logical file ranges to chunk references, resolves chunk locations, coalesces adjacent compressed chunk reads from the same pack, decompresses selected chunks, and stores decompressed chunks in the local disposable cache. The FUSE crate is intentionally thin and delegates file content reads to `TreeReader`.
 
 Enable tracing to inspect lazy reads:
 

@@ -108,7 +108,6 @@ macro_rules! id_type {
 }
 
 id_type!(TreeId);
-id_type!(LayoutId);
 id_type!(PackId);
 id_type!(ChunkId);
 id_type!(ProfileId);
