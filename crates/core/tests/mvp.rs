@@ -88,6 +88,7 @@ async fn range_read_spanning_multiple_chunks() {
         input.path(),
         PackConfig {
             chunk_size: 4 * 1024 * 1024,
+            compression_level: 0,
             pack_workers: 2,
             key: "test-large".to_string(),
         },
@@ -138,6 +139,7 @@ async fn pack_directory_bundles_small_files_into_shared_chunks() {
         input.path(),
         PackConfig {
             chunk_size: 1024,
+            compression_level: 0,
             pack_workers: 2,
             key: "test-bundle".to_string(),
         },

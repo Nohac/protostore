@@ -22,7 +22,7 @@ No CI executor, action keys, checkpoints, writable overlays, GC, inline small-fi
 ## Local Quickstart
 
 ```bash
-cargo run -p protostore-cli -- pack ./examples/data --store file:///tmp/protostore-store --chunk-size 16MiB --pack-workers 8
+cargo run -p protostore-cli -- pack ./examples/data --store file:///tmp/protostore-store --chunk-size 16MiB --compression-level 0 --pack-workers 8
 cargo run -p protostore-cli -- inspect <key> --store file:///tmp/protostore-store
 cargo run -p protostore-cli -- materialize <key> /tmp/protostore-out --store file:///tmp/protostore-store --target-coalesce 64MiB
 ```
@@ -38,7 +38,7 @@ cat /tmp/protostore-mnt/some-file
 Useful size flags accept plain bytes or `KiB`/`MiB`/`GiB` suffixes:
 
 ```bash
-protostore pack <dir> --store file:///tmp/store --chunk-size 16MiB --pack-workers 8 --key cargo-cache/<cache-key>
+protostore pack <dir> --store file:///tmp/store --chunk-size 16MiB --compression-level 3 --pack-workers 8 --key cargo-cache/<cache-key>
 protostore mount <key> <mnt> --store file:///tmp/store --min-remote-read 16MiB --target-coalesce 64MiB
 protostore materialize <key> <out> --store file:///tmp/store --min-remote-read 16MiB --target-coalesce 64MiB
 ```
@@ -63,7 +63,7 @@ Pack blobs use a fixed header, independently compressed zstd chunk frames, a JSO
 
 Pack, tree, and layout objects are written under the same key. `--key` controls the object names below `packs/`, `trees/`, and `layouts/`; if omitted, the CLI uses a generated UUIDv7 key and prints it. Each pack operation currently writes `packs/<key>.pack`, `trees/<key>.tree`, and `layouts/<key>.layout`. Manifests still store `tree_id`, `layout_id`, and `pack_hash` for integrity instead of requiring content-addressed object names.
 
-Packing uses bounded `tokio-uring` workers on Linux to read files and compute chunk hashes/compression concurrently. The CLI defaults `--pack-workers` to the number of available CPU threads. Tree identity is based on logical file content; physical pack layout is stored separately in a layout object.
+Packing uses bounded `tokio-uring` workers on Linux to read files and compute chunk hashes/compression concurrently. The CLI defaults `--pack-workers` to the number of available CPU threads and `--compression-level` to `0`, which uses zstd's default level. Tree identity is based on logical file content; physical pack layout is stored separately in a layout object.
 
 ## Lazy Reads And FUSE
 

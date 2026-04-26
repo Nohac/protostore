@@ -2,7 +2,8 @@ use crate::{
     cache::LocalCache,
     hash::{ChunkId, Hash32, LayoutId, ProfileId, TreeId},
     pack::{
-        ChunkEntry, Compression, StreamingPackWriter, compress_chunk, read_chunk_from_pack_key,
+        ChunkEntry, Compression, StreamingPackWriter, compress_chunk_with_level,
+        read_chunk_from_pack_key,
     },
     profile::load_profile,
     reader::{ReadConfig, TreeReader},
@@ -23,11 +24,13 @@ use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 pub const DEFAULT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+pub const DEFAULT_COMPRESSION_LEVEL: i32 = 0;
 const STREAM_UPLOAD_PART_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackConfig {
     pub chunk_size: usize,
+    pub compression_level: i32,
     pub pack_workers: usize,
     pub key: String,
 }
@@ -42,6 +45,7 @@ impl Default for PackConfig {
     fn default() -> Self {
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
+            compression_level: DEFAULT_COMPRESSION_LEVEL,
             pack_workers: default_pack_workers(),
             key: generated_pack_key(),
         }
@@ -54,6 +58,10 @@ impl PackConfig {
         ensure!(
             self.chunk_size <= u32::MAX as usize,
             "chunk size must fit in u32"
+        );
+        ensure!(
+            (-131_072..=22).contains(&self.compression_level),
+            "zstd compression level must be between -131072 and 22"
         );
         ensure!(
             self.pack_workers > 0,
@@ -258,6 +266,7 @@ pub async fn pack_directory_with_config<S: BlobStore>(
         batch_rx,
         ready_tx.clone(),
         config.chunk_size,
+        config.compression_level,
     );
     drop(ready_tx);
 
@@ -330,6 +339,7 @@ fn spawn_pack_workers(
     batch_rx: Receiver<BatchJob>,
     ready_tx: Sender<Result<ReadyChunk>>,
     chunk_size: usize,
+    compression_level: i32,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let use_uring = io_uring_available();
     if !use_uring {
@@ -352,7 +362,13 @@ fn spawn_pack_workers(
                             file_count = batch.files.len(),
                             "pack worker processing batch with io_uring"
                         );
-                        let result = process_batch_with_uring(batch, chunk_size, &ready_tx).await;
+                        let result = process_batch_with_uring(
+                            batch,
+                            chunk_size,
+                            compression_level,
+                            &ready_tx,
+                        )
+                        .await;
                         if let Err(error) = result {
                             let _ = ready_tx.send(Err(error)).await;
                             break;
@@ -367,7 +383,8 @@ fn spawn_pack_workers(
                         file_count = batch.files.len(),
                         "pack worker processing batch with blocking reads"
                     );
-                    let result = process_batch_blocking(batch, chunk_size, &ready_tx);
+                    let result =
+                        process_batch_blocking(batch, chunk_size, compression_level, &ready_tx);
                     if let Err(error) = result {
                         let _ = ready_tx.send_blocking(Err(error));
                         break;
@@ -435,21 +452,25 @@ fn io_uring_available() -> bool {
 async fn process_batch_with_uring(
     batch: BatchJob,
     chunk_size: usize,
+    compression_level: i32,
     ready_tx: &Sender<Result<ReadyChunk>>,
 ) -> Result<()> {
     if batch.files.len() > 1 {
-        let ready = bundle_small_files_with_uring(batch.files).await?;
+        let ready = bundle_small_files_with_uring(batch.files, compression_level).await?;
         send_ready_async(ready_tx, ready).await?;
         return Ok(());
     }
 
     if let Some(file) = batch.files.into_iter().next() {
-        split_file_with_uring(file, chunk_size, ready_tx).await?;
+        split_file_with_uring(file, chunk_size, compression_level, ready_tx).await?;
     }
     Ok(())
 }
 
-async fn bundle_small_files_with_uring(files: Vec<FileJob>) -> Result<ReadyChunk> {
+async fn bundle_small_files_with_uring(
+    files: Vec<FileJob>,
+    compression_level: i32,
+) -> Result<ReadyChunk> {
     let total_len = files.iter().try_fold(0usize, |acc, file| {
         Ok::<_, anyhow::Error>(acc + usize::try_from(file.size)?)
     })?;
@@ -467,12 +488,13 @@ async fn bundle_small_files_with_uring(files: Vec<FileJob>) -> Result<ReadyChunk
         });
         payload.extend_from_slice(&bytes);
     }
-    ready_chunk(refs, payload)
+    ready_chunk(refs, payload, compression_level)
 }
 
 async fn split_file_with_uring(
     file: FileJob,
     chunk_size: usize,
+    compression_level: i32,
     ready_tx: &Sender<Result<ReadyChunk>>,
 ) -> Result<()> {
     let source = tokio_uring::fs::File::open(&file.path)
@@ -492,6 +514,7 @@ async fn split_file_with_uring(
                 uncompressed_len,
             }],
             payload,
+            compression_level,
         )?;
         send_ready_async(ready_tx, ready).await?;
         offset += u64::from(uncompressed_len);
@@ -542,21 +565,22 @@ async fn send_ready_async(ready_tx: &Sender<Result<ReadyChunk>>, ready: ReadyChu
 fn process_batch_blocking(
     batch: BatchJob,
     chunk_size: usize,
+    compression_level: i32,
     ready_tx: &Sender<Result<ReadyChunk>>,
 ) -> Result<()> {
     if batch.files.len() > 1 {
-        let ready = bundle_small_files_blocking(batch.files)?;
+        let ready = bundle_small_files_blocking(batch.files, compression_level)?;
         send_ready_blocking(ready_tx, ready)?;
         return Ok(());
     }
 
     if let Some(file) = batch.files.into_iter().next() {
-        split_file_blocking(file, chunk_size, ready_tx)?;
+        split_file_blocking(file, chunk_size, compression_level, ready_tx)?;
     }
     Ok(())
 }
 
-fn bundle_small_files_blocking(files: Vec<FileJob>) -> Result<ReadyChunk> {
+fn bundle_small_files_blocking(files: Vec<FileJob>, compression_level: i32) -> Result<ReadyChunk> {
     let total_len = files.iter().try_fold(0usize, |acc, file| {
         Ok::<_, anyhow::Error>(acc + usize::try_from(file.size)?)
     })?;
@@ -574,12 +598,13 @@ fn bundle_small_files_blocking(files: Vec<FileJob>) -> Result<ReadyChunk> {
         });
         payload.extend_from_slice(&bytes);
     }
-    ready_chunk(refs, payload)
+    ready_chunk(refs, payload, compression_level)
 }
 
 fn split_file_blocking(
     file: FileJob,
     chunk_size: usize,
+    compression_level: i32,
     ready_tx: &Sender<Result<ReadyChunk>>,
 ) -> Result<()> {
     let source =
@@ -598,6 +623,7 @@ fn split_file_blocking(
                 uncompressed_len,
             }],
             payload,
+            compression_level,
         )?;
         send_ready_blocking(ready_tx, ready)?;
         offset += u64::from(uncompressed_len);
@@ -642,10 +668,14 @@ fn send_ready_blocking(ready_tx: &Sender<Result<ReadyChunk>>, ready: ReadyChunk)
         .map_err(|_| anyhow!("pack writer stopped"))
 }
 
-fn ready_chunk(refs: Vec<ReadyChunkRef>, payload: Vec<u8>) -> Result<ReadyChunk> {
+fn ready_chunk(
+    refs: Vec<ReadyChunkRef>,
+    payload: Vec<u8>,
+    compression_level: i32,
+) -> Result<ReadyChunk> {
     let chunk_id = ChunkId::new(Hash32::digest(&payload));
     let uncompressed_len = u32::try_from(payload.len()).context("chunk length overflow")?;
-    let compressed = compress_chunk(&payload)?;
+    let compressed = compress_chunk_with_level(&payload, compression_level)?;
     Ok(ReadyChunk {
         refs,
         chunk_id,
@@ -843,7 +873,7 @@ pub async fn repack_tree_with_config<S: BlobStore>(
             ChunkId::new(Hash32::digest(&decompressed)) == chunk_id,
             "chunk hash mismatch while repacking {chunk_id}"
         );
-        let compressed = compress_chunk(&decompressed)?;
+        let compressed = compress_chunk_with_level(&decompressed, config.compression_level)?;
         append_compressed_chunk_to_pack(
             store,
             &config,

@@ -19,6 +19,12 @@ pub enum Command {
         chunk_size: Option<usize>,
         #[arg(
             long,
+            default_value_t = 0,
+            help = "Zstd compression level. 0 uses the zstd default."
+        )]
+        compression_level: i32,
+        #[arg(
+            long,
             help = "Number of parallel pack workers. Defaults to available CPU threads."
         )]
         pack_workers: Option<usize>,

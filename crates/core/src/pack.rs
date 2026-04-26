@@ -43,7 +43,11 @@ pub struct EncodedPack {
 }
 
 pub fn compress_chunk(bytes: &[u8]) -> Result<Vec<u8>> {
-    zstd::stream::encode_all(bytes, 0).context("zstd compress chunk")
+    compress_chunk_with_level(bytes, 0)
+}
+
+pub fn compress_chunk_with_level(bytes: &[u8], level: i32) -> Result<Vec<u8>> {
+    zstd::stream::encode_all(bytes, level).context("zstd compress chunk")
 }
 
 pub fn decompress_chunk(bytes: &[u8]) -> Result<Vec<u8>> {
