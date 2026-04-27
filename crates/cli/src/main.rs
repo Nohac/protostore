@@ -8,6 +8,7 @@ use protostore_core::{
     materialize_tree_with_config, pack_directory_with_config, repack_tree,
 };
 use std::{path::Path, str::FromStr, thread, time::Duration};
+use tokio::runtime::Handle;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
@@ -16,6 +17,11 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
+    runtime.block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Pack {
             directory,
@@ -25,17 +31,14 @@ fn main() -> Result<()> {
             pack_workers,
             key,
         } => {
-            let store = ObjectBlobStore::from_uri(&store)?;
+            let store = ObjectBlobStore::from_uri(&store).await?;
             let pack_config = pack_config(chunk_size, compression_level, pack_workers, key)?;
-            let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
-            let packed =
-                runtime.block_on(pack_directory_with_config(&store, &directory, pack_config))?;
+            let packed = pack_directory_with_config(&store, &directory, pack_config).await?;
             println!("{}", packed.key);
         }
         Command::Inspect { key, store } => {
-            let store = ObjectBlobStore::from_uri(&store)?;
-            let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
-            let tree = runtime.block_on(protostore_core::tree::load_tree(&store, &key))?;
+            let store = ObjectBlobStore::from_uri(&store).await?;
+            let tree = protostore_core::tree::load_tree(&store, &key).await?;
             println!("{}", inspect_tree(tree.tree_id, &tree));
         }
         Command::Mount {
@@ -48,7 +51,6 @@ fn main() -> Result<()> {
             read_ahead_bytes,
             read_ahead_concurrency,
         } => {
-            let store = ObjectBlobStore::from_uri(&store)?;
             let read_config = read_config(
                 min_remote_read,
                 target_coalesce,
@@ -56,15 +58,16 @@ fn main() -> Result<()> {
                 read_ahead_bytes,
                 read_ahead_concurrency,
             )?;
-            let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
+            let store = ObjectBlobStore::from_uri(&store).await?;
             let session = protostore_fuse::ProtoStoreFuseBuilder::new(store, key)
-                .runtime_handle(runtime.handle().clone())
+                .runtime_handle(Handle::current())
                 .cache(LocalCache::disposable_default())
                 .read_config(read_config)
-                .spawn(&mountpoint)?;
+                .spawn_async(&mountpoint)
+                .await?;
             eprintln!("mounted {}. Press Ctrl-C to unmount.", mountpoint.display());
-            runtime
-                .block_on(tokio::signal::ctrl_c())
+            tokio::signal::ctrl_c()
+                .await
                 .context("waiting for Ctrl-C")?;
             eprintln!("unmounting {}", mountpoint.display());
             drop(session);
@@ -94,7 +97,6 @@ fn main() -> Result<()> {
             read_ahead_bytes,
             read_ahead_concurrency,
         } => {
-            let store = ObjectBlobStore::from_uri(&store)?;
             let read_config = read_config(
                 min_remote_read,
                 target_coalesce,
@@ -102,14 +104,15 @@ fn main() -> Result<()> {
                 read_ahead_bytes,
                 read_ahead_concurrency,
             )?;
-            let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
-            runtime.block_on(materialize_tree_with_config(
+            let store = ObjectBlobStore::from_uri(&store).await?;
+            materialize_tree_with_config(
                 store,
                 &key,
                 &output_dir,
                 LocalCache::disposable_default(),
                 read_config,
-            ))?;
+            )
+            .await?;
         }
         Command::Repack {
             key,
@@ -117,9 +120,8 @@ fn main() -> Result<()> {
             store,
         } => {
             let profile_id = ProfileId::from_str(&profile).context("parsing profile id")?;
-            let store = ObjectBlobStore::from_uri(&store)?;
-            let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
-            let packed = runtime.block_on(repack_tree(&store, &key, profile_id))?;
+            let store = ObjectBlobStore::from_uri(&store).await?;
+            let packed = repack_tree(&store, &key, profile_id).await?;
             println!("{}", packed.key);
         }
     }

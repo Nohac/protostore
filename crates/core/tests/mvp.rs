@@ -20,7 +20,7 @@ fn write(path: &Path, bytes: &[u8]) {
 }
 
 fn local_store(dir: &TempDir) -> ObjectBlobStore {
-    ObjectBlobStore::from_uri(&format!("file://{}", dir.path().display())).unwrap()
+    ObjectBlobStore::local(dir.path()).unwrap()
 }
 
 #[test]

@@ -83,6 +83,22 @@ impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
         Ok((fs, options))
     }
 
+    async fn into_filesystem_async(self) -> Result<(ProtoStoreFs<S>, Vec<MountOption>)> {
+        let runtime = self
+            .runtime
+            .context("FUSE builder requires a Tokio runtime handle")?;
+        let reader =
+            TreeReader::open_with_config(self.store, self.key, self.cache, self.read_config)
+                .await
+                .context("opening tree reader for FUSE")?;
+        let fs = ProtoStoreFs::new(runtime, reader);
+        let mut options = vec![MountOption::RO, MountOption::FSName(self.fs_name)];
+        if self.default_permissions {
+            options.push(MountOption::DefaultPermissions);
+        }
+        Ok((fs, options))
+    }
+
     pub fn mount(self, mountpoint: &Path) -> Result<()> {
         let (fs, options) = self.into_filesystem()?;
         fuser::mount2(fs, mountpoint, &options)
@@ -94,6 +110,15 @@ impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
         S: Send + 'static,
     {
         let (fs, options) = self.into_filesystem()?;
+        fuser::spawn_mount2(fs, mountpoint, &options)
+            .with_context(|| format!("mounting {}", mountpoint.display()))
+    }
+
+    pub async fn spawn_async(self, mountpoint: &Path) -> Result<BackgroundSession>
+    where
+        S: Send + 'static,
+    {
+        let (fs, options) = self.into_filesystem_async().await?;
         fuser::spawn_mount2(fs, mountpoint, &options)
             .with_context(|| format!("mounting {}", mountpoint.display()))
     }
