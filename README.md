@@ -9,6 +9,7 @@ It is the storage substrate for a future `protoci`: `protostore` owns packs, chu
 - Pack a directory into zstd-compressed, independently decompressible chunks.
 - Store immutable pack blobs, tree manifests, and access profiles in object storage.
 - Use `file://` stores through `object_store::local::LocalFileSystem`.
+- Use `gs://bucket/prefix` stores through the `object_store` GCS adapter.
 - Read files lazily through `TreeReader::read_at`.
 - Materialize a stored tree back to a normal directory.
 - Inspect tree metadata.
@@ -39,8 +40,22 @@ Useful size flags accept plain bytes or `KiB`/`MiB`/`GiB` suffixes:
 
 ```bash
 protostore pack <dir> --store file:///tmp/store --chunk-size 16MiB --compression-level 3 --pack-workers 8 --key cargo-cache/<cache-key>
-protostore mount <key> <mnt> --store file:///tmp/store --min-remote-read 16MiB --target-coalesce 64MiB
-protostore materialize <key> <out> --store file:///tmp/store --min-remote-read 16MiB --target-coalesce 64MiB
+protostore mount <key> <mnt> --store file:///tmp/store --min-remote-read 16MiB --target-coalesce 64MiB --read-ahead-chunks 4 --read-ahead-bytes 64MiB --read-ahead-concurrency 2
+protostore materialize <key> <out> --store file:///tmp/store --min-remote-read 16MiB --target-coalesce 64MiB --read-ahead-chunks 4 --read-ahead-bytes 64MiB --read-ahead-concurrency 2
+```
+
+For GCS, authenticate through the environment variables supported by `object_store`:
+
+```bash
+export SERVICE_ACCOUNT=/path/to/service-account.json
+# or:
+export GOOGLE_SERVICE_ACCOUNT=/path/to/service-account.json
+# or ADC:
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/application-default-credentials.json
+
+protostore pack ./examples/data --store gs://my-bucket/protostore --key examples/data
+protostore inspect examples/data --store gs://my-bucket/protostore
+protostore materialize examples/data /tmp/protostore-out --store gs://my-bucket/protostore
 ```
 
 ## Storage Layout
@@ -64,9 +79,11 @@ Pack and tree objects are written under the same key. `--key` controls the objec
 
 Packing uses bounded `tokio-uring` workers on Linux to read files and compute chunk hashes/compression concurrently. The CLI defaults `--pack-workers` to the number of available CPU threads and `--compression-level` to `0`, which uses zstd's default level. Tree identity is based on logical file content.
 
+For `file://` stores, pack uploads write directly to the final local path so streaming progress is visible on disk. Remote stores use the provider multipart writer exposed by `object_store`; the object should be treated as committed only after the upload finishes.
+
 ## Lazy Reads And FUSE
 
-`TreeReader` loads a tree, maps logical file ranges to chunk references, resolves chunk locations, coalesces adjacent compressed chunk reads from the same pack, decompresses selected chunks, and stores decompressed chunks in the local disposable cache. The FUSE crate is intentionally thin and delegates file content reads to `TreeReader`.
+`TreeReader` loads a tree, maps logical file ranges to chunk references, resolves chunk locations, coalesces adjacent compressed chunk reads from the same pack, decompresses selected chunks, and stores decompressed chunks in the local disposable cache. After a read, it schedules bounded read-ahead for following chunks so sequential FUSE reads can overlap future object-store range requests. The FUSE crate is intentionally thin and delegates file content reads to `TreeReader`.
 
 Enable tracing to inspect lazy reads:
 
@@ -76,10 +93,10 @@ RUST_LOG='protostore::reader=debug,protostore::object_store=debug' \
   protostore mount <key> <mnt> --store file:///tmp/store
 ```
 
-Look for `read_at selected chunk`, `fetch coalesced compressed chunk range`, `object range read`, `decompress chunk`, and `chunk cache hit`.
+Look for `read_at selected chunk`, `start read-ahead`, `fetch coalesced compressed chunk range`, `object range read`, `decompress chunk`, and `chunk cache hit`.
 
 ## Known Limitations
 
-- `file://` stores are implemented first; S3/GCS/Azure URI parsing is not wired yet.
+- `gs://` is wired through `object_store`, but GCS integration tests require real credentials and are not part of the default test suite.
 - Pack index loading currently fetches the full pack before parsing the footer, while file-content reads use coalesced compressed chunk ranges.
 - Access profiles are implemented in core, but the CLI does not yet expose explicit profiling flags for materialize/read.

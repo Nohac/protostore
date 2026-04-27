@@ -44,9 +44,18 @@ fn main() -> Result<()> {
             store,
             min_remote_read,
             target_coalesce,
+            read_ahead_chunks,
+            read_ahead_bytes,
+            read_ahead_concurrency,
         } => {
             let store = ObjectBlobStore::from_uri(&store)?;
-            let read_config = read_config(min_remote_read, target_coalesce)?;
+            let read_config = read_config(
+                min_remote_read,
+                target_coalesce,
+                read_ahead_chunks,
+                read_ahead_bytes,
+                read_ahead_concurrency,
+            )?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
             let session = protostore_fuse::ProtoStoreFuseBuilder::new(store, key)
                 .runtime_handle(runtime.handle().clone())
@@ -81,9 +90,18 @@ fn main() -> Result<()> {
             store,
             min_remote_read,
             target_coalesce,
+            read_ahead_chunks,
+            read_ahead_bytes,
+            read_ahead_concurrency,
         } => {
             let store = ObjectBlobStore::from_uri(&store)?;
-            let read_config = read_config(min_remote_read, target_coalesce)?;
+            let read_config = read_config(
+                min_remote_read,
+                target_coalesce,
+                read_ahead_chunks,
+                read_ahead_bytes,
+                read_ahead_concurrency,
+            )?;
             let runtime = tokio::runtime::Runtime::new().context("creating Tokio runtime")?;
             runtime.block_on(materialize_tree_with_config(
                 store,
@@ -151,12 +169,18 @@ fn pack_config(
 fn read_config(
     min_remote_read: Option<usize>,
     target_coalesce: Option<usize>,
+    read_ahead_chunks: Option<usize>,
+    read_ahead_bytes: Option<usize>,
+    read_ahead_concurrency: Option<usize>,
 ) -> Result<ReadConfig> {
     let defaults = ReadConfig::default();
     let min_remote_read = min_remote_read.unwrap_or(defaults.min_remote_read);
     ReadConfig {
         min_remote_read,
         target_coalesce: target_coalesce.unwrap_or(defaults.target_coalesce.max(min_remote_read)),
+        read_ahead_chunks: read_ahead_chunks.unwrap_or(defaults.read_ahead_chunks),
+        read_ahead_bytes: read_ahead_bytes.unwrap_or(defaults.read_ahead_bytes),
+        read_ahead_concurrency: read_ahead_concurrency.unwrap_or(defaults.read_ahead_concurrency),
     }
     .validate()
 }

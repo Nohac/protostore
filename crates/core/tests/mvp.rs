@@ -1,6 +1,6 @@
 use protostore_core::{
     BlobStore, ChunkId, FileChunkRef, FileNode, Hash32, LocalCache, ObjectBlobStore, PackConfig,
-    ProfileRecorder, TreeId, TreeReader,
+    ProfileRecorder, ReadConfig, TreeId, TreeReader,
     pack::{FOOTER_LEN, compress_chunk, decompress_chunk, encode_pack, parse_footer},
     pack_directory_with_config,
     profile::write_profile,
@@ -10,6 +10,7 @@ use protostore_core::{
 };
 use std::{fs, path::Path};
 use tempfile::TempDir;
+use tokio::time::{Duration, sleep};
 
 fn write(path: &Path, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
@@ -181,6 +182,58 @@ async fn tree_reader_full_and_partial_file_reads() {
         "0123456789"
     );
     assert_eq!(reader.read_at("file.txt", 4, 3).await.unwrap(), "456");
+}
+
+#[tokio::test]
+async fn tree_reader_prefetches_following_chunks() {
+    let input = TempDir::new().unwrap();
+    let store_dir = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let bytes = b"abcdefghijklmnopqrstuvwxyz".repeat(1024);
+    write(&input.path().join("large.txt"), &bytes);
+    let store = local_store(&store_dir);
+    let packed = pack_directory_with_config(
+        &store,
+        input.path(),
+        PackConfig {
+            chunk_size: 4096,
+            compression_level: 0,
+            pack_workers: 2,
+            key: "test-read-ahead".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let tree = load_tree(&store, &packed.key).await.unwrap();
+    assert!(tree.files[0].chunks.len() > 2);
+    let prefetched = tree.files[0].chunks[1].chunk_id;
+    let cache = LocalCache::new(cache_dir.path());
+    let reader = TreeReader::open_with_config(
+        store,
+        packed.key,
+        cache.clone(),
+        ReadConfig {
+            min_remote_read: 1,
+            target_coalesce: 8192,
+            read_ahead_chunks: 2,
+            read_ahead_bytes: 8192,
+            read_ahead_concurrency: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        reader.read_at("large.txt", 0, 16).await.unwrap(),
+        &bytes[..16]
+    );
+    for _ in 0..20 {
+        if cache.contains_chunk(prefetched).await.unwrap() {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("expected read-ahead chunk to be cached");
 }
 
 #[test]

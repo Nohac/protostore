@@ -48,6 +48,12 @@ pub enum Command {
         min_remote_read: Option<usize>,
         #[arg(long, value_parser = crate::parse_size)]
         target_coalesce: Option<usize>,
+        #[arg(long, help = "Number of following chunks to prefetch after reads.")]
+        read_ahead_chunks: Option<usize>,
+        #[arg(long, value_parser = crate::parse_size, help = "Maximum compressed bytes to prefetch after reads.")]
+        read_ahead_bytes: Option<usize>,
+        #[arg(long, help = "Maximum concurrent read-ahead range requests.")]
+        read_ahead_concurrency: Option<usize>,
     },
     Materialize {
         key: String,
@@ -58,6 +64,12 @@ pub enum Command {
         min_remote_read: Option<usize>,
         #[arg(long, value_parser = crate::parse_size)]
         target_coalesce: Option<usize>,
+        #[arg(long, help = "Number of following chunks to prefetch after reads.")]
+        read_ahead_chunks: Option<usize>,
+        #[arg(long, value_parser = crate::parse_size, help = "Maximum compressed bytes to prefetch after reads.")]
+        read_ahead_bytes: Option<usize>,
+        #[arg(long, help = "Maximum concurrent read-ahead range requests.")]
+        read_ahead_concurrency: Option<usize>,
     },
     Repack {
         key: String,

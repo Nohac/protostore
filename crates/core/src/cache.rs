@@ -33,6 +33,13 @@ impl LocalCache {
         Ok(Some(Bytes::from(bytes)))
     }
 
+    pub async fn contains_chunk(&self, chunk_id: ChunkId) -> Result<bool> {
+        let path = self.chunk_path(chunk_id);
+        fs::try_exists(&path)
+            .await
+            .with_context(|| format!("checking cached chunk {}", path.display()))
+    }
+
     pub async fn put_chunk(&self, chunk_id: ChunkId, bytes: &[u8]) -> Result<()> {
         let path = self.chunk_path(chunk_id);
         if let Some(parent) = path.parent() {

@@ -8,9 +8,17 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use bytes::{Bytes, BytesMut};
-use std::{collections::HashMap, path::Path};
-use tokio::{fs, io::AsyncWriteExt};
-use tracing::{debug, info};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
+use tokio::{
+    fs,
+    io::AsyncWriteExt,
+    sync::{Mutex, Semaphore},
+};
+use tracing::{debug, info, warn};
 
 #[derive(Clone)]
 pub struct TreeReader<S> {
@@ -23,12 +31,17 @@ pub struct TreeReader<S> {
     cache: LocalCache,
     recorder: Option<ProfileRecorder>,
     read_config: ReadConfig,
+    prefetching: Arc<Mutex<HashSet<crate::ChunkId>>>,
+    prefetch_permits: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadConfig {
     pub min_remote_read: usize,
     pub target_coalesce: usize,
+    pub read_ahead_chunks: usize,
+    pub read_ahead_bytes: usize,
+    pub read_ahead_concurrency: usize,
 }
 
 impl Default for ReadConfig {
@@ -36,6 +49,9 @@ impl Default for ReadConfig {
         Self {
             min_remote_read: 16 * 1024 * 1024,
             target_coalesce: 64 * 1024 * 1024,
+            read_ahead_chunks: 4,
+            read_ahead_bytes: 64 * 1024 * 1024,
+            read_ahead_concurrency: 2,
         }
     }
 }
@@ -49,6 +65,12 @@ impl ReadConfig {
         ensure!(
             self.target_coalesce >= self.min_remote_read,
             "target coalesce size must be at least min remote read size"
+        );
+        ensure!(
+            self.read_ahead_concurrency > 0
+                || self.read_ahead_chunks == 0
+                || self.read_ahead_bytes == 0,
+            "read ahead concurrency must be greater than zero when read ahead is enabled"
         );
         Ok(self)
     }
@@ -114,6 +136,8 @@ impl<S: BlobStore> TreeReader<S> {
             cache,
             recorder,
             read_config,
+            prefetching: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_permits: Arc::new(Semaphore::new(read_config.read_ahead_concurrency.max(1))),
         })
     }
 
@@ -193,6 +217,7 @@ impl<S: BlobStore> TreeReader<S> {
             });
         }
         let chunks = self.read_chunks(&selected).await?;
+        self.schedule_read_ahead(file, end, &selected).await?;
         for selected in selected {
             let chunk_bytes = chunks
                 .get(&selected.chunk_id)
@@ -246,7 +271,7 @@ impl<S: BlobStore> TreeReader<S> {
         }
 
         for group in self.coalesce_misses(misses) {
-            self.fetch_group(group, &mut out).await?;
+            self.fetch_group(group, &mut out, true).await?;
         }
 
         Ok(out)
@@ -285,6 +310,7 @@ impl<S: BlobStore> TreeReader<S> {
         &self,
         group: Vec<crate::ChunkLocationHint>,
         out: &mut HashMap<crate::ChunkId, Bytes>,
+        record_access: bool,
     ) -> Result<()> {
         let first = group.first().context("empty chunk fetch group")?;
         let last = group.last().context("empty chunk fetch group")?;
@@ -344,10 +370,119 @@ impl<S: BlobStore> TreeReader<S> {
                 "cache decompressed chunk"
             );
             self.cache.put_chunk(hint.chunk_id, &decompressed).await?;
-            if let Some(recorder) = &self.recorder {
+            if record_access && let Some(recorder) = &self.recorder {
                 recorder.record(self.tree_id, hint.chunk_id);
             }
             out.insert(hint.chunk_id, Bytes::from(decompressed));
+        }
+        Ok(())
+    }
+
+    async fn schedule_read_ahead(
+        &self,
+        file: &FileNode,
+        read_end: u64,
+        selected: &[SelectedChunk],
+    ) -> Result<()> {
+        if self.read_config.read_ahead_chunks == 0 || self.read_config.read_ahead_bytes == 0 {
+            return Ok(());
+        }
+
+        let selected: HashSet<_> = selected.iter().map(|chunk| chunk.chunk_id).collect();
+        let mut hints = Vec::new();
+        let mut compressed_bytes = 0usize;
+
+        for chunk in &file.chunks {
+            let chunk_end = chunk.file_offset + u64::from(chunk.uncompressed_len);
+            if chunk_end <= read_end || selected.contains(&chunk.chunk_id) {
+                continue;
+            }
+            if self.cache.contains_chunk(chunk.chunk_id).await? {
+                continue;
+            }
+
+            let hint = self.locations.get(&chunk.chunk_id).with_context(|| {
+                format!("missing location for read-ahead chunk {}", chunk.chunk_id)
+            })?;
+
+            {
+                let mut prefetching = self.prefetching.lock().await;
+                if !prefetching.insert(chunk.chunk_id) {
+                    continue;
+                }
+            }
+
+            compressed_bytes = compressed_bytes.saturating_add(hint.compressed_len as usize);
+            hints.push(hint.clone());
+            if hints.len() >= self.read_config.read_ahead_chunks
+                || compressed_bytes >= self.read_config.read_ahead_bytes
+            {
+                break;
+            }
+        }
+
+        if hints.is_empty() {
+            return Ok(());
+        }
+
+        let permit = match self.prefetch_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let mut prefetching = self.prefetching.lock().await;
+                for hint in hints {
+                    prefetching.remove(&hint.chunk_id);
+                }
+                debug!(
+                    target: "protostore::reader",
+                    tree_id = %self.tree_id,
+                    path = %file.path,
+                    "skip read-ahead because all prefetch slots are busy"
+                );
+                return Ok(());
+            }
+        };
+
+        let reader = self.clone();
+        let path = file.path.clone();
+        tokio::spawn(async move {
+            let chunk_ids: Vec<_> = hints.iter().map(|hint| hint.chunk_id).collect();
+            info!(
+                target: "protostore::reader",
+                tree_id = %reader.tree_id,
+                path,
+                chunk_count = hints.len(),
+                "start read-ahead"
+            );
+            if let Err(error) = reader.prefetch_hints(hints).await {
+                warn!(
+                    target: "protostore::reader",
+                    tree_id = %reader.tree_id,
+                    error = ?error,
+                    "read-ahead failed"
+                );
+            }
+            let mut prefetching = reader.prefetching.lock().await;
+            for chunk_id in chunk_ids {
+                prefetching.remove(&chunk_id);
+            }
+            drop(permit);
+        });
+
+        Ok(())
+    }
+
+    async fn prefetch_hints(&self, hints: Vec<crate::ChunkLocationHint>) -> Result<()> {
+        let mut misses = Vec::new();
+        for hint in hints {
+            if self.cache.contains_chunk(hint.chunk_id).await? {
+                continue;
+            }
+            misses.push(hint);
+        }
+
+        let mut discarded = HashMap::new();
+        for group in self.coalesce_misses(misses) {
+            self.fetch_group(group, &mut discarded, false).await?;
         }
         Ok(())
     }
