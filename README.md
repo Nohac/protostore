@@ -44,14 +44,13 @@ protostore mount <key> <mnt> --store file:///tmp/store --min-remote-read 16MiB -
 protostore materialize <key> <out> --store file:///tmp/store --min-remote-read 16MiB --target-coalesce 64MiB --read-ahead-chunks 4 --read-ahead-bytes 64MiB --read-ahead-concurrency 2
 ```
 
-For GCS, authenticate through the environment variables supported by `object_store`:
+For GCS, authenticate through Application Default Credentials used by the official Google Cloud
+Storage SDK:
 
 ```bash
-export SERVICE_ACCOUNT=/path/to/service-account.json
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 # or:
-export GOOGLE_SERVICE_ACCOUNT=/path/to/service-account.json
-# or ADC:
-export GOOGLE_APPLICATION_CREDENTIALS=/path/to/application-default-credentials.json
+gcloud auth application-default login
 
 protostore pack ./examples/data --store gs://my-bucket/protostore --key examples/data
 protostore inspect examples/data --store gs://my-bucket/protostore
@@ -85,6 +84,8 @@ For `file://` stores, pack uploads write directly to the final local path so str
 
 `TreeReader` loads a tree, maps logical file ranges to chunk references, resolves chunk locations, coalesces adjacent compressed chunk reads from the same pack, decompresses selected chunks, and stores decompressed chunks in the local disposable cache. After a read, it schedules bounded read-ahead for following chunks so sequential FUSE reads can overlap future object-store range requests. The FUSE crate is intentionally thin and delegates file content reads to `TreeReader`.
 
+FUSE mounts are read-only and tuned for immutable trees. The kernel receives long attribute/entry TTLs, a larger preferred block size, negotiated max readahead from `--target-coalesce`, higher background request limits, and `FOPEN_KEEP_CACHE` on file opens so repeated opens can reuse the kernel page cache.
+
 Enable tracing to inspect lazy reads:
 
 ```bash
@@ -93,10 +94,17 @@ RUST_LOG='protostore::reader=debug,protostore::object_store=debug' \
   protostore mount <key> <mnt> --store file:///tmp/store
 ```
 
-Look for `read_at selected chunk`, `start read-ahead`, `fetch coalesced compressed chunk range`, `object range read`, `decompress chunk`, and `chunk cache hit`.
+For FUSE-level events too:
+
+```bash
+RUST_LOG='protostore::fuse=debug,protostore::reader=debug,protostore::object_store=debug' \
+  protostore mount <key> <mnt> --store file:///tmp/store
+```
+
+Look for `configured immutable FUSE mount`, `lookup`, `open`, `read`, `read_at selected chunk`, `start read-ahead`, `fetch coalesced compressed chunk range`, `object range read`, `decompress chunk`, and `chunk cache hit`.
 
 ## Known Limitations
 
-- `gs://` is wired through `object_store`, but GCS integration tests require real credentials and are not part of the default test suite.
+- `gs://` is wired through the official Google Cloud Storage Rust SDK, but GCS integration tests require real credentials and are not part of the default test suite.
 - Pack index loading currently fetches the full pack before parsing the footer, while file-content reads use coalesced compressed chunk ranges.
 - Access profiles are implemented in core, but the CLI does not yet expose explicit profiling flags for materialize/read.

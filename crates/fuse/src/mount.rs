@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use fuser::{
-    BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, ReplyOpen, Request,
+    BackgroundSession, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
+    ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request,
 };
 use protostore_core::{BlobStore, LocalCache, ReadConfig, TreeReader};
 use std::{
@@ -11,9 +11,45 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::runtime::Handle;
+use tracing::{debug, info, warn};
 
-const TTL: Duration = Duration::from_secs(1);
 const ROOT_INO: u64 = 1;
+const IMMUTABLE_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+const DEFAULT_MAX_BACKGROUND: u16 = 64;
+const DEFAULT_CONGESTION_THRESHOLD: u16 = 48;
+
+#[derive(Debug, Clone, Copy)]
+pub struct FuseTuning {
+    pub ttl: Duration,
+    pub blksize: u32,
+    pub max_readahead: u32,
+    pub max_background: u16,
+    pub congestion_threshold: u16,
+    pub keep_cache: bool,
+}
+
+impl FuseTuning {
+    pub fn immutable(read_config: ReadConfig) -> Self {
+        Self {
+            ttl: IMMUTABLE_TTL,
+            blksize: clamp_u32(read_config.min_remote_read),
+            max_readahead: clamp_u32(read_config.target_coalesce),
+            max_background: DEFAULT_MAX_BACKGROUND,
+            congestion_threshold: DEFAULT_CONGESTION_THRESHOLD,
+            keep_cache: true,
+        }
+    }
+}
+
+impl Default for FuseTuning {
+    fn default() -> Self {
+        Self::immutable(ReadConfig::default())
+    }
+}
+
+fn clamp_u32(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
+}
 
 pub struct ProtoStoreFuseBuilder<S> {
     store: S,
@@ -23,6 +59,7 @@ pub struct ProtoStoreFuseBuilder<S> {
     runtime: Option<Handle>,
     fs_name: String,
     default_permissions: bool,
+    fuse_tuning: Option<FuseTuning>,
 }
 
 impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
@@ -35,6 +72,7 @@ impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
             runtime: None,
             fs_name: "protostore".to_string(),
             default_permissions: true,
+            fuse_tuning: None,
         }
     }
 
@@ -63,19 +101,28 @@ impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
         self
     }
 
+    pub fn fuse_tuning(mut self, fuse_tuning: FuseTuning) -> Self {
+        self.fuse_tuning = Some(fuse_tuning);
+        self
+    }
+
     fn into_filesystem(self) -> Result<(ProtoStoreFs<S>, Vec<MountOption>)> {
         let runtime = self
             .runtime
             .context("FUSE builder requires a Tokio runtime handle")?;
+        let read_config = self.read_config;
+        let fuse_tuning = self
+            .fuse_tuning
+            .unwrap_or_else(|| FuseTuning::immutable(read_config));
         let reader = runtime
             .block_on(TreeReader::open_with_config(
                 self.store,
                 self.key,
                 self.cache,
-                self.read_config,
+                read_config,
             ))
             .context("opening tree reader for FUSE")?;
-        let fs = ProtoStoreFs::new(runtime, reader);
+        let fs = ProtoStoreFs::new(runtime, reader, fuse_tuning);
         let mut options = vec![MountOption::RO, MountOption::FSName(self.fs_name)];
         if self.default_permissions {
             options.push(MountOption::DefaultPermissions);
@@ -87,11 +134,14 @@ impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
         let runtime = self
             .runtime
             .context("FUSE builder requires a Tokio runtime handle")?;
-        let reader =
-            TreeReader::open_with_config(self.store, self.key, self.cache, self.read_config)
-                .await
-                .context("opening tree reader for FUSE")?;
-        let fs = ProtoStoreFs::new(runtime, reader);
+        let read_config = self.read_config;
+        let fuse_tuning = self
+            .fuse_tuning
+            .unwrap_or_else(|| FuseTuning::immutable(read_config));
+        let reader = TreeReader::open_with_config(self.store, self.key, self.cache, read_config)
+            .await
+            .context("opening tree reader for FUSE")?;
+        let fs = ProtoStoreFs::new(runtime, reader, fuse_tuning);
         let mut options = vec![MountOption::RO, MountOption::FSName(self.fs_name)];
         if self.default_permissions {
             options.push(MountOption::DefaultPermissions);
@@ -155,10 +205,11 @@ struct ProtoStoreFs<S> {
     reader: TreeReader<S>,
     nodes: HashMap<u64, Node>,
     by_parent_name: HashMap<(u64, OsString), u64>,
+    fuse_tuning: FuseTuning,
 }
 
 impl<S: BlobStore> ProtoStoreFs<S> {
-    fn new(runtime: Handle, reader: TreeReader<S>) -> Self {
+    fn new(runtime: Handle, reader: TreeReader<S>, fuse_tuning: FuseTuning) -> Self {
         let mut nodes = HashMap::new();
         let mut by_parent_name = HashMap::new();
         nodes.insert(
@@ -228,10 +279,11 @@ impl<S: BlobStore> ProtoStoreFs<S> {
             reader,
             nodes,
             by_parent_name,
+            fuse_tuning,
         }
     }
 
-    fn attr(node: &Node) -> FileAttr {
+    fn attr(&self, node: &Node) -> FileAttr {
         FileAttr {
             ino: node.ino,
             size: node.size,
@@ -251,17 +303,73 @@ impl<S: BlobStore> ProtoStoreFs<S> {
             gid: 0,
             rdev: 0,
             flags: 0,
-            blksize: 4096,
+            blksize: self.fuse_tuning.blksize,
         }
     }
 }
 
 impl<S: BlobStore> Filesystem for ProtoStoreFs<S> {
+    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+        let tuning = self.fuse_tuning;
+        match config.set_max_readahead(tuning.max_readahead) {
+            Ok(previous) => {
+                info!(
+                    target: "protostore::fuse",
+                    requested = tuning.max_readahead,
+                    previous,
+                    "configured FUSE max readahead"
+                );
+            }
+            Err(max_supported) => {
+                let applied = max_supported.max(1);
+                let _ = config.set_max_readahead(applied);
+                warn!(
+                    target: "protostore::fuse",
+                    requested = tuning.max_readahead,
+                    applied,
+                    "kernel capped FUSE max readahead"
+                );
+            }
+        }
+
+        if let Err(nearest) = config.set_max_background(tuning.max_background) {
+            warn!(
+                target: "protostore::fuse",
+                requested = tuning.max_background,
+                nearest,
+                "kernel rejected FUSE max background request"
+            );
+        }
+        if let Err(nearest) = config.set_congestion_threshold(tuning.congestion_threshold) {
+            warn!(
+                target: "protostore::fuse",
+                requested = tuning.congestion_threshold,
+                nearest,
+                "kernel rejected FUSE congestion threshold request"
+            );
+        }
+        info!(
+            target: "protostore::fuse",
+            ttl_secs = tuning.ttl.as_secs(),
+            blksize = tuning.blksize,
+            keep_cache = tuning.keep_cache,
+            "configured immutable FUSE mount"
+        );
+        Ok(())
+    }
+
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let key = (parent, name.to_os_string());
         if let Some(ino) = self.by_parent_name.get(&key).copied() {
             if let Some(node) = self.nodes.get(&ino) {
-                reply.entry(&TTL, &Self::attr(node), 0);
+                debug!(
+                    target: "protostore::fuse",
+                    parent,
+                    ino,
+                    name = %name.to_string_lossy(),
+                    "lookup"
+                );
+                reply.entry(&self.fuse_tuning.ttl, &self.attr(node), 0);
                 return;
             }
         }
@@ -270,7 +378,8 @@ impl<S: BlobStore> Filesystem for ProtoStoreFs<S> {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         if let Some(node) = self.nodes.get(&ino) {
-            reply.attr(&TTL, &Self::attr(node));
+            debug!(target: "protostore::fuse", ino, "getattr");
+            reply.attr(&self.fuse_tuning.ttl, &self.attr(node));
         } else {
             reply.error(libc::ENOENT);
         }
@@ -311,7 +420,21 @@ impl<S: BlobStore> Filesystem for ProtoStoreFs<S> {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         match self.nodes.get(&ino) {
-            Some(node) if node.kind == FileType::RegularFile => reply.opened(0, 0),
+            Some(node) if node.kind == FileType::RegularFile => {
+                let flags = if self.fuse_tuning.keep_cache {
+                    fuser::consts::FOPEN_KEEP_CACHE
+                } else {
+                    0
+                };
+                debug!(
+                    target: "protostore::fuse",
+                    ino,
+                    path = %node.path,
+                    keep_cache = self.fuse_tuning.keep_cache,
+                    "open"
+                );
+                reply.opened(0, flags);
+            }
             Some(_) => reply.error(libc::EISDIR),
             None => reply.error(libc::ENOENT),
         }
@@ -340,6 +463,14 @@ impl<S: BlobStore> Filesystem for ProtoStoreFs<S> {
             reply.error(libc::EISDIR);
             return;
         }
+        debug!(
+            target: "protostore::fuse",
+            ino,
+            path = %node.path,
+            offset,
+            size,
+            "read"
+        );
         match self.runtime.block_on(
             self.reader
                 .read_at(&node.path, offset as u64, size as usize),

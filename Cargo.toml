@@ -19,7 +19,7 @@ blake3 = "1"
 bytes = "1"
 camino = { version = "1", features = ["serde1"] }
 clap = { version = "4", features = ["derive"] }
-fuser = "0.15"
+fuser = { version = "0.15", features = ["abi-7-31"] }
 google-cloud-storage = "1.11"
 hex = "0.4"
 ignore = "0.4"
