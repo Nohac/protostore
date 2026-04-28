@@ -3,7 +3,7 @@ use fuser::{
     BackgroundSession, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
     ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request,
 };
-use protostore_core::{BlobStore, LocalCache, ReadConfig, TreeReader};
+use protostore_core::{BlobStore, LocalCache, ReadConfig, TreeManifest, TreeReader};
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::{OsStr, OsString},
@@ -122,7 +122,8 @@ impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
                 read_config,
             ))
             .context("opening tree reader for FUSE")?;
-        let fs = ProtoStoreFs::new(runtime, reader, fuse_tuning);
+        let reader = BlockingTreeReader::new(runtime, reader);
+        let fs = ProtoStoreFs::new(reader, fuse_tuning);
         let mut options = vec![MountOption::RO, MountOption::FSName(self.fs_name)];
         if self.default_permissions {
             options.push(MountOption::DefaultPermissions);
@@ -141,7 +142,8 @@ impl<S: BlobStore> ProtoStoreFuseBuilder<S> {
         let reader = TreeReader::open_with_config(self.store, self.key, self.cache, read_config)
             .await
             .context("opening tree reader for FUSE")?;
-        let fs = ProtoStoreFs::new(runtime, reader, fuse_tuning);
+        let reader = BlockingTreeReader::new(runtime, reader);
+        let fs = ProtoStoreFs::new(reader, fuse_tuning);
         let mut options = vec![MountOption::RO, MountOption::FSName(self.fs_name)];
         if self.default_permissions {
             options.push(MountOption::DefaultPermissions);
@@ -201,15 +203,14 @@ struct Node {
 }
 
 struct ProtoStoreFs<S> {
-    runtime: Handle,
-    reader: TreeReader<S>,
+    reader: BlockingTreeReader<S>,
     nodes: HashMap<u64, Node>,
     by_parent_name: HashMap<(u64, OsString), u64>,
     fuse_tuning: FuseTuning,
 }
 
 impl<S: BlobStore> ProtoStoreFs<S> {
-    fn new(runtime: Handle, reader: TreeReader<S>, fuse_tuning: FuseTuning) -> Self {
+    fn new(reader: BlockingTreeReader<S>, fuse_tuning: FuseTuning) -> Self {
         let mut nodes = HashMap::new();
         let mut by_parent_name = HashMap::new();
         nodes.insert(
@@ -275,7 +276,6 @@ impl<S: BlobStore> ProtoStoreFs<S> {
             }
         }
         Self {
-            runtime,
             reader,
             nodes,
             by_parent_name,
@@ -471,12 +471,32 @@ impl<S: BlobStore> Filesystem for ProtoStoreFs<S> {
             size,
             "read"
         );
-        match self.runtime.block_on(
-            self.reader
-                .read_at(&node.path, offset as u64, size as usize),
-        ) {
+        match self
+            .reader
+            .read_at(&node.path, offset as u64, size as usize)
+        {
             Ok(bytes) => reply.data(&bytes),
             Err(_) => reply.error(libc::EIO),
         }
+    }
+}
+
+struct BlockingTreeReader<S> {
+    runtime: Handle,
+    reader: TreeReader<S>,
+}
+
+impl<S: BlobStore> BlockingTreeReader<S> {
+    fn new(runtime: Handle, reader: TreeReader<S>) -> Self {
+        Self { runtime, reader }
+    }
+
+    fn tree(&self) -> &TreeManifest {
+        self.reader.tree()
+    }
+
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<bytes::Bytes> {
+        self.runtime
+            .block_on(self.reader.read_at(path, offset, len))
     }
 }

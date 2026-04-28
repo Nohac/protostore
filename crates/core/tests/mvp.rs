@@ -1,6 +1,8 @@
+use async_trait::async_trait;
+use bytes::Bytes;
 use protostore_core::{
-    BlobStore, ChunkId, FileChunkRef, FileNode, Hash32, LocalCache, ObjectBlobStore, PackConfig,
-    ProfileRecorder, ReadConfig, TreeId, TreeReader,
+    BlobStore, BlobUpload, ChunkId, FileChunkRef, FileNode, Hash32, LocalCache, ObjectBlobStore,
+    PackConfig, ProfileRecorder, ReadConfig, TreeId, TreeReader,
     pack::{FOOTER_LEN, compress_chunk, decompress_chunk, encode_pack, parse_footer},
     pack_directory_with_config,
     profile::write_profile,
@@ -8,7 +10,15 @@ use protostore_core::{
         LogicalTreeManifest, decode_tree_manifest, load_tree, pack_directory, repack_tree, tree_id,
     },
 };
-use std::{fs, path::Path};
+use serde::{Serialize, de::DeserializeOwned};
+use std::{
+    fs,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use tempfile::TempDir;
 use tokio::time::{Duration, sleep};
 
@@ -21,6 +31,61 @@ fn write(path: &Path, bytes: &[u8]) {
 
 fn local_store(dir: &TempDir) -> ObjectBlobStore {
     ObjectBlobStore::local(dir.path()).unwrap()
+}
+
+#[derive(Clone)]
+struct CountingStore<S> {
+    inner: S,
+    range_reads: Arc<AtomicUsize>,
+}
+
+impl<S> CountingStore<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            range_reads: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn range_reads(&self) -> usize {
+        self.range_reads.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl<S: BlobStore> BlobStore for CountingStore<S> {
+    async fn put_bytes(&self, key: &str, bytes: Bytes) -> anyhow::Result<()> {
+        self.inner.put_bytes(key, bytes).await
+    }
+
+    async fn begin_multipart(
+        &self,
+        key: &str,
+        part_size: usize,
+    ) -> anyhow::Result<Box<dyn BlobUpload>> {
+        self.inner.begin_multipart(key, part_size).await
+    }
+
+    async fn get_bytes(&self, key: &str) -> anyhow::Result<Bytes> {
+        self.inner.get_bytes(key).await
+    }
+
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> anyhow::Result<Bytes> {
+        self.range_reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_range(key, offset, len).await
+    }
+
+    async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_json<T: Serialize + Sync>(&self, key: &str, value: &T) -> anyhow::Result<()> {
+        self.inner.put_json(key, value).await
+    }
+
+    async fn get_json<T: DeserializeOwned>(&self, key: &str) -> anyhow::Result<T> {
+        self.inner.get_json(key).await
+    }
 }
 
 #[test]
@@ -234,6 +299,52 @@ async fn tree_reader_prefetches_following_chunks() {
         sleep(Duration::from_millis(10)).await;
     }
     panic!("expected read-ahead chunk to be cached");
+}
+
+#[tokio::test]
+async fn tree_reader_coalesces_concurrent_same_chunk_reads() {
+    let input = TempDir::new().unwrap();
+    let store_dir = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let bytes = b"abcdefghijklmnopqrstuvwxyz".repeat(1024);
+    write(&input.path().join("large.txt"), &bytes);
+    let store = local_store(&store_dir);
+    let packed = pack_directory_with_config(
+        &store,
+        input.path(),
+        PackConfig {
+            chunk_size: 4096,
+            compression_level: 0,
+            pack_workers: 2,
+            key: "test-concurrent-read".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let counting = CountingStore::new(store);
+    let reader = TreeReader::open_with_config(
+        counting.clone(),
+        packed.key,
+        LocalCache::new(cache_dir.path()),
+        ReadConfig {
+            min_remote_read: 1,
+            target_coalesce: 4096,
+            read_ahead_chunks: 0,
+            read_ahead_bytes: 0,
+            read_ahead_concurrency: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (first, second) = tokio::join!(
+        reader.read_at("large.txt", 0, 128),
+        reader.read_at("large.txt", 64, 128),
+    );
+
+    assert_eq!(first.unwrap(), &bytes[..128]);
+    assert_eq!(second.unwrap(), &bytes[64..192]);
+    assert_eq!(counting.range_reads(), 1);
 }
 
 #[test]
